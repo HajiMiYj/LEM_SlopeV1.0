@@ -12,26 +12,8 @@ from core.slip_surface import BaseSlipSurface, CircularSlipSurface
 
 class Slice:
     """单个竖直切片土条的综合力学与几何微元对象"""
-
-    def __init__(
-        self,
-        index: int,
-        xm: float,
-        b: float,
-        h: float,
-        y_top: float,
-        y_base: float,
-        alpha: float,
-        l: float,
-        W: float,
-        q_load: float,
-        kh: float,
-        u: float,
-        suction: float,
-        c_total: float,
-        phi: float,
-        layer_name: str,
-    ):
+    def __init__(self, index, xm, b, h, y_top, y_base, alpha, l,
+                 W, q_load, kh, u, suction, c_total, phi, layer_name):
         self.index = index
         self.xm = xm
         self.b = b
@@ -55,7 +37,7 @@ class Slice:
 def create_slices(
     geom: SlopeGeometry,
     materials: List[SoilMaterial],
-    xc=None,                              # 兼容旧接口：可以是数字(Xc) 也可以是 BaseSlipSurface
+    xc=None,
     yc: Optional[float] = None,
     R: Optional[float] = None,
     n_slices: int = 30,
@@ -64,20 +46,13 @@ def create_slices(
     slip_surface: Optional[BaseSlipSurface] = None,
     tension_crack=None,
     anchors=None,
-    **kwargs,                             # 仅为兼容旧接口，不推荐使用
+    **kwargs,
 ) -> Tuple[Optional[List[Slice]], Optional[Tuple[float, float, np.ndarray]], str]:
-    """
-    通用边坡切片剖分器（同时支持圆弧与非圆弧折线滑面）
-
-    返回: (slices, (x_start, x_end, x_edges), message)
-      - 成功: 第三项为 "切片剖分成功"
-      - 失败: slices 与 info 均为 None, 第三项为具体原因
-    """
+    """通用边坡切片剖分器（同时支持圆弧与非圆弧折线滑面）"""
     if n_slices < 1:
         return None, None, "切片数必须 ≥ 1"
 
-    # ---------- 1. 统一提取滑面对象 ----------
-    # 兼容：xc 位置传了一个滑面对象（旧接口）
+    # 1. 统一提取滑面对象
     if isinstance(xc, BaseSlipSurface) and slip_surface is None:
         slip_surface = xc
         xc = None
@@ -87,7 +62,7 @@ def create_slices(
             return None, None, "未指定滑面参数（需提供 slip_surface 或 xc/yc/R）"
         slip_surface = CircularSlipSurface(float(xc), float(yc), float(R))
 
-    # ---------- 2. 求滑面与地表的水平跨越区间 ----------
+    # 2. 滑面与地表求交
     inter = slip_surface.get_x_range(geom.gx, geom.gy)
     if not inter:
         return None, None, "滑面未在边坡内部切出有效滑动体"
@@ -98,8 +73,6 @@ def create_slices(
 
     x_edges = np.linspace(x_start, x_end, n_slices + 1)
     slices: List[Slice] = []
-
-    # 允许的最小条底厚度（m），防止极端薄条造成数值爆炸
     MIN_THICKNESS = 1e-3
 
     for i in range(n_slices):
@@ -110,12 +83,8 @@ def create_slices(
             return None, None, f"第 {i+1} 条宽度非法: b={b}"
 
         y_top = geom.get_ground_elevation(xm)
-
-        # ---------- 3. 底高程与倾角 ----------
         y_base = slip_surface.get_y_base(xm)
 
-        # 滑面穿出地面 → 整条滑面作废
-        # 用极宽容差 -1e-6，只拦“真的冒头”，避免浮点误差误杀浅滑面
         if y_base >= y_top - 1e-6:
             return None, None, (
                 f"滑面穿出地面: 第{i+1}条 xm={xm:.3f}, "
@@ -123,20 +92,18 @@ def create_slices(
             )
 
         h = max(MIN_THICKNESS, y_top - y_base)
-
         alpha = float(slip_surface.get_alpha(xm))
-        # 折线滑面在折点附近 alpha 可能接近 ±π/2，这里钳制 cos 避免 l 爆炸
         cos_a = np.cos(alpha)
         if abs(cos_a) < 0.1:
             cos_a = 0.1 if cos_a >= 0 else -0.1
         l = b / cos_a
 
-        # ---------- 4. 水位与湿润锋 ----------
+        # 3. 水位与湿润锋
         yw = geom.get_water_elevation(xm)
         wetting_front_y = y_top - max(0.0, float(rainfall_depth))
 
-        # ---------- 5. 多层地层自重积分 ----------
-        strata_y = geom.get_strata_elevations(xm)
+        # 4. 多层地层自重积分 (★ 关键: 用 get_layer_breakpoints 找分层)
+        strata_y = geom.get_layer_breakpoints(xm, y_base, y_top)
         div_points = [y_top]
         for sy in strata_y:
             if y_base + 1e-9 < sy < y_top - 1e-9:
@@ -152,7 +119,8 @@ def create_slices(
                 continue
             seg_mid_y = 0.5 * (y_high + y_low)
 
-            layer_idx = min(geom.get_layer_index_at(xm, seg_mid_y), len(materials) - 1)
+            layer_idx = min(geom.get_layer_index_at(xm, seg_mid_y),
+                            len(materials) - 1)
             mat = materials[layer_idx]
 
             is_saturated = (
@@ -162,7 +130,7 @@ def create_slices(
             use_gamma = mat.gamma_sat if is_saturated else mat.gamma_dry
             W_soil += use_gamma * b * seg_h
 
-        # ---------- 6. 外载与孔隙水压力 ----------
+        # 5. 外载与孔隙水压力
         q_load = geom.get_surcharge_at(xm) * b
 
         if yw is not None:
@@ -171,12 +139,12 @@ def create_slices(
         else:
             u, suction = 0.0, 0.0
 
-        # 降雨湿润锋之下认为吸力已丧失
         if rainfall_depth > 0.0 and y_base >= wetting_front_y:
             suction = 0.0
 
-        # ---------- 7. 条底力学参数 ----------
-        base_layer_idx = min(geom.get_layer_index_at(xm, y_base), len(materials) - 1)
+        # 6. 条底力学参数
+        base_layer_idx = min(geom.get_layer_index_at(xm, y_base),
+                             len(materials) - 1)
         base_mat = materials[base_layer_idx]
 
         s_obj = Slice(
