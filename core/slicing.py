@@ -32,6 +32,7 @@ class Slice:
         self.c = c_total
         self.phi = phi
         self.layer_name = layer_name
+        self.y_cg = None  # 重心高度, 后续计算中可更新
 
 
 def create_slices(

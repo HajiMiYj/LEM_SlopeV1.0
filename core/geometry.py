@@ -51,13 +51,21 @@ class SlopeGeometry:
     # 土层判定 (基于面, 后画覆盖先画)
     # ------------------------------------------------------------------
     def get_layer_index_at(self, x: float, y: float) -> int:
-        """从后往前遍历 regions, 返回第一个包含 (x, y) 的面的 material_index"""
+        """从后往前遍历 regions, 返回第一个"包含 (x,y) 且不在其洞内"的面"""
         for region in reversed(self.layer_regions):
             points = region.get("points", []) if isinstance(region, dict) else []
-            if self._point_in_polygon(x, y, points):
+            holes = region.get("holes", []) if isinstance(region, dict) else []
+            if self._point_in_region(x, y, points, holes):
                 return max(0, int(region.get("material_index", 0)))
         return 0
 
+    def _point_in_region(self, x, y, outer, holes):
+        if not self._point_in_polygon(x, y, outer):
+            return False
+        for h in holes:
+            if len(h) >= 3 and self._point_in_polygon(x, y, h):
+                return False
+        return True
     @staticmethod
     def _point_in_polygon(x: float, y: float, points: list) -> bool:
         """射线法判定点是否在多边形内"""

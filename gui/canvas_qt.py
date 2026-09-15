@@ -8,91 +8,8 @@ from PyQt5.QtWidgets import (
     QGraphicsPathItem, QGraphicsLineItem, QGraphicsRectItem,
     QGraphicsEllipseItem
 )
-from PyQt5.QtGui import QPen, QBrush, QColor, QPainter, QPolygonF, QPainterPath
+from PyQt5.QtGui import QPen, QBrush, QColor, QPainter, QPolygonF, QPainterPath, QPixmap
 from PyQt5.QtCore import Qt, QPointF, QRectF, QLineF, pyqtSignal
-
-
-class LayerRegionGraphicsItem(QGraphicsPolygonItem):
-    """土层面图元 (支持 hover 高亮 + Tooltip 显示材料信息)"""
-
-    def __init__(self, region_data, polygon, material_info=None):
-        super().__init__(polygon)
-        self.region_data = region_data
-        self.material_info = material_info or {}
-
-        base_color = QColor(region_data.get("color", "#f3dfaa"))
-        pattern = region_data.get("pattern", "solid")
-
-        # 常态
-        self.default_brush = QBrush(base_color, self._pattern_for(pattern))
-        self.default_pen = QPen(base_color.darker(140), 1.5)
-        self.default_pen.setCosmetic(True)
-
-        # 悬停态 (更亮 + 更明显的边框)
-        hover_color = QColor(base_color)
-        hover_color = hover_color.lighter(115)
-        self.hover_brush = QBrush(hover_color, self._pattern_for(pattern))
-        self.hover_pen = QPen(QColor(41, 128, 185), 2.5)
-        self.hover_pen.setCosmetic(True)
-
-        self.setBrush(self.default_brush)
-        self.setPen(self.default_pen)
-        self.setAcceptHoverEvents(True)
-
-        self._build_tooltip()
-
-    @staticmethod
-    def _pattern_for(p):
-        pat = {
-            "solid": Qt.SolidPattern,
-            "sand": Qt.Dense4Pattern,
-            "clay": Qt.BDiagPattern,
-            "gravel": Qt.CrossPattern,
-            "rock": Qt.DiagCrossPattern,
-        }
-        return pat.get(p, Qt.SolidPattern)
-
-    def _build_tooltip(self):
-        name = self.region_data.get("name", "土层面")
-        mat = self.material_info
-        mat_name = mat.get("name", "—")
-
-        lines = [
-            f"<b style='font-size:13px;'>{name}</b>",
-            f"<hr style='margin:4px 0;'>",
-            f"<b>材料:</b> {mat_name}",
-        ]
-        if mat:
-            lines += [
-                f"<b>γ:</b> {mat.get('gamma_dry', '—')} kN/m³",
-                f"<b>γsat:</b> {mat.get('gamma_sat', '—')} kN/m³",
-                f"<b>c':</b> {mat.get('c_prime', '—')} kPa",
-                f"<b>φ':</b> {mat.get('phi_deg', '—')}°",
-            ]
-        # 顶点数
-        pts = self.region_data.get("points", [])
-        lines.append(f"<b>顶点数:</b> {len(pts)}")
-
-        html = (
-            "<div style='font-family: Microsoft YaHei; font-size: 12px; "
-            "color: #2c3e50;'>"
-            + "<br>".join(lines) +
-            "</div>"
-        )
-        self.setToolTip(html)
-
-    def hoverEnterEvent(self, event):
-        self.setBrush(self.hover_brush)
-        self.setPen(self.hover_pen)
-        super().hoverEnterEvent(event)
-
-    def hoverLeaveEvent(self, event):
-        self.setBrush(self.default_brush)
-        self.setPen(self.default_pen)
-        super().hoverLeaveEvent(event)
-        
-        
-
 
 class SliceGraphicsItem(QGraphicsPolygonItem):
     """具有悬停高亮与力学物理量 Tooltip 的土条交互图元"""
@@ -140,11 +57,106 @@ class SliceGraphicsItem(QGraphicsPolygonItem):
         self.setBrush(self.default_brush)
         super().hoverLeaveEvent(event)
 
-class LayerRegionGraphicsItem(QGraphicsPolygonItem):
-    """土层面图元 (支持 hover / 选中高亮 + Tooltip 显示材料信息)"""
 
-    def __init__(self, region_data, polygon, material_info=None, region_index=-1):
-        super().__init__(polygon)
+class HatchPatternFactory:
+    """按岩土工程制图规范生成填充画刷
+
+    支持图案:
+      · solid        纯色
+      · clay         黏土 - 45° 斜线
+      · silt         粉质黏土 - 竖短线 + 点
+      · sand         砂土 - 密集点
+      · gravel       砾石 - 交叉网格 + 圆点
+      · rock_strong  强风化岩 - 交叉斜线
+      · rock_medium  中风化岩 - 单向斜线
+      · rock_fresh   新鲜岩石 - 小三角形
+      · fill         素填土 - 稀疏点
+    """
+
+    _cache = {}   # 缓存 QPixmap, 避免每次重建
+
+    @classmethod
+    def make_brush(cls, pattern_id: str, base_color: QColor) -> QBrush:
+        # ---- 简单图案: 直接用 Qt 内置 ----
+        if pattern_id == "solid":
+            return QBrush(base_color, Qt.SolidPattern)
+        if pattern_id == "sand":
+            return QBrush(base_color, Qt.Dense6Pattern)
+        if pattern_id == "rock_strong":
+            return QBrush(base_color, Qt.DiagCrossPattern)
+        if pattern_id == "rock_medium":
+            return QBrush(base_color, Qt.BDiagPattern)
+        if pattern_id == "fill":
+            return QBrush(base_color, Qt.Dense4Pattern)
+
+        # ---- 复杂图案: 用 QPixmap 绘制纹理 ----
+        cache_key = (pattern_id, base_color.name())
+        if cache_key in cls._cache:
+            return QBrush(cls._cache[cache_key])
+
+        pix = QPixmap(24, 24)
+        pix.fill(base_color)
+
+        painter = QPainter(pix)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        fg = base_color.darker(160)
+        pen = QPen(fg, 1.0)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+
+        if pattern_id == "clay":
+            # 45° 斜线, 间距 6px
+            for i in range(-24, 48, 6):
+                painter.drawLine(i, 0, i + 24, 24)
+
+        elif pattern_id == "silt":
+            # 竖向短线 + 底部小点
+            for x in range(4, 24, 8):
+                painter.drawLine(x, 4, x, 16)
+            painter.setBrush(fg)
+            painter.setPen(Qt.NoPen)
+            for x in range(8, 24, 8):
+                painter.drawEllipse(QPointF(x, 20), 1.0, 1.0)
+
+        elif pattern_id == "gravel":
+            # 交叉网格 + 4 个圆点
+            for i in range(-24, 48, 8):
+                painter.drawLine(i, 0, i + 24, 24)
+                painter.drawLine(i, 24, i + 24, 0)
+            painter.setBrush(fg)
+            painter.setPen(Qt.NoPen)
+            for x in (6, 18):
+                for y in (6, 18):
+                    painter.drawEllipse(QPointF(x, y), 1.2, 1.2)
+
+        elif pattern_id == "rock_fresh":
+            # 小三角形排列
+            painter.setBrush(Qt.NoBrush)
+            for y in (3, 13):
+                for x in (3, 13):
+                    painter.drawPolygon(
+                        QPointF(x, y),
+                        QPointF(x + 5, y),
+                        QPointF(x + 2.5, y + 5),
+                    )
+        else:
+            # 未知图案 → 退化到纯色
+            painter.end()
+            return QBrush(base_color, Qt.SolidPattern)
+
+        painter.end()
+        cls._cache[cache_key] = pix
+        return QBrush(pix)
+
+class LayerRegionGraphicsItem(QGraphicsPathItem):
+    """土层面图元 (带洞 + 规范填充 + hover / 选中高亮 + Tooltip)
+
+    继承 QGraphicsPathItem, 支持带洞多边形 (OddEvenFill)。
+    """
+
+    def __init__(self, region_data, path, material_info=None, region_index=-1):
+        super().__init__(path)
         self.region_data = region_data
         self.material_info = material_info or {}
         self.region_index = region_index
@@ -152,17 +164,20 @@ class LayerRegionGraphicsItem(QGraphicsPolygonItem):
         base_color = QColor(region_data.get("color", "#f3dfaa"))
         pattern = region_data.get("pattern", "solid")
 
-        self.default_brush = QBrush(base_color, self._pattern_for(pattern))
-        self.default_pen = QPen(base_color.darker(140), 1.5)
+        # ---- 常态画刷 (规范填充) ----
+        self.default_brush = HatchPatternFactory.make_brush(pattern, base_color)
+        self.default_pen = QPen(base_color.darker(160), 1.5)
         self.default_pen.setCosmetic(True)
 
+        # ---- 悬停画刷 (提亮 + 蓝色边框) ----
         hover_color = QColor(base_color).lighter(115)
-        self.hover_brush = QBrush(hover_color, self._pattern_for(pattern))
+        self.hover_brush = HatchPatternFactory.make_brush(pattern, hover_color)
         self.hover_pen = QPen(QColor(41, 128, 185), 2.5)
         self.hover_pen.setCosmetic(True)
 
+        # ---- 选中画刷 (加亮 + 红色粗边框) ----
         sel_color = QColor(base_color).lighter(130)
-        self.selected_brush = QBrush(sel_color, self._pattern_for(pattern))
+        self.selected_brush = HatchPatternFactory.make_brush(pattern, sel_color)
         self.selected_pen = QPen(QColor(192, 57, 43), 3.0)
         self.selected_pen.setCosmetic(True)
 
@@ -172,26 +187,33 @@ class LayerRegionGraphicsItem(QGraphicsPolygonItem):
         self.setBrush(self.default_brush)
         self.setPen(self.default_pen)
         self.setAcceptHoverEvents(True)
+
         self._build_tooltip()
 
-    @staticmethod
-    def _pattern_for(p):
-        pat = {
-            "solid": Qt.SolidPattern,
-            "sand": Qt.Dense4Pattern,
-            "clay": Qt.BDiagPattern,
-            "gravel": Qt.CrossPattern,
-            "rock": Qt.DiagCrossPattern,
-        }
-        return pat.get(p, Qt.SolidPattern)
-
+    # ==================================================================
+    # Tooltip
+    # ==================================================================
     def _build_tooltip(self):
         name = self.region_data.get("name", "土层面")
         mat = self.material_info
+        mat_name = mat.get("name", "—")
+
+        pattern_cn = {
+            "solid":        "纯色",
+            "clay":         "45°斜线 (黏土)",
+            "silt":         "竖短线+点 (粉质黏土)",
+            "sand":         "点状 (砂土)",
+            "gravel":       "交叉网格 (砾石)",
+            "rock_strong":  "交叉斜线 (强风化岩)",
+            "rock_medium":  "单向斜线 (中风化岩)",
+            "rock_fresh":   "三角符号 (新鲜岩石)",
+            "fill":         "稀疏点 (素填土)",
+        }.get(self.region_data.get("pattern", "solid"), "—")
+
         lines = [
             f"<b style='font-size:13px;'>{name}</b>",
             "<hr style='margin:4px 0;'>",
-            f"<b>材料:</b> {mat.get('name', '—')}",
+            f"<b>材料:</b> {mat_name}",
         ]
         if mat:
             lines += [
@@ -200,13 +222,22 @@ class LayerRegionGraphicsItem(QGraphicsPolygonItem):
                 f"<b>c':</b> {mat.get('c_prime', '—')} kPa",
                 f"<b>φ':</b> {mat.get('phi_deg', '—')}°",
             ]
+
         pts = self.region_data.get("points", [])
-        lines.append(f"<b>顶点数:</b> {len(pts)}")
+        holes = self.region_data.get("holes", [])
+        lines.append(f"<b>填充:</b> {pattern_cn}")
+        lines.append(f"<b>外环顶点:</b> {len(pts)}")
+        if holes:
+            lines.append(f"<b>洞数:</b> {len(holes)}")
+
         self.setToolTip(
             "<div style='font-family: Microsoft YaHei; font-size: 12px; "
             "color: #2c3e50;'>" + "<br>".join(lines) + "</div>"
         )
 
+    # ==================================================================
+    # 状态刷新
+    # ==================================================================
     def _refresh_style(self):
         if self._selected:
             self.setBrush(self.selected_brush)
@@ -218,6 +249,9 @@ class LayerRegionGraphicsItem(QGraphicsPolygonItem):
             self.setBrush(self.default_brush)
             self.setPen(self.default_pen)
 
+    # ==================================================================
+    # 事件
+    # ==================================================================
     def hoverEnterEvent(self, event):
         self._hovered = True
         self._refresh_style()
@@ -228,10 +262,13 @@ class LayerRegionGraphicsItem(QGraphicsPolygonItem):
         self._refresh_style()
         super().hoverLeaveEvent(event)
 
+    # ==================================================================
+    # 外部接口
+    # ==================================================================
     def set_selected(self, flag):
+        """图层树选中时调用, flag=True 高亮"""
         self._selected = bool(flag)
         self._refresh_style()
-
 
 class SlopeGraphicsView(QGraphicsView):
     """基于 PyQt5 QGraphicsView 的专业 CAD 级交互视口"""
@@ -674,29 +711,43 @@ class SlopeGraphicsView(QGraphicsView):
         min_x = ground_x[0] - 5.0
         max_x = ground_x[-1] + 5.0
 
-        # ---------- 1. 土层面 (带 hover / 选中高亮) ----------
+        # ---------- 1. 土层面 (带洞, hover / 选中高亮) ----------
         self._layer_items = []
         if layer_regions:
             for r_idx, region in enumerate(layer_regions):
-                points = region.get("points", []) if isinstance(region, dict) else region
-                if len(points) < 3:
+                if not isinstance(region, dict):
                     continue
 
-                poly = QPolygonF([QPointF(float(x), float(y)) for x, y in points])
+                outer = region.get("points", [])
+                holes = region.get("holes", [])
+                if len(outer) < 3:
+                    continue
 
-                mat_idx = int(region.get("material_index", 0)) if isinstance(region, dict) else 0
+                # 构造带洞 QPainterPath, OddEvenFill 自动挖洞
+                path = QPainterPath()
+                path.setFillRule(Qt.OddEvenFill)
+                path.addPolygon(QPolygonF([QPointF(float(x), float(y)) for x, y in outer]))
+                path.closeSubpath()
+                for hole in holes:
+                    if len(hole) >= 3:
+                        path.addPolygon(
+                            QPolygonF([QPointF(float(x), float(y)) for x, y in hole])
+                        )
+                        path.closeSubpath()
+
+                mat_idx = int(region.get("material_index", 0))
                 mat_info = None
                 if materials and 0 <= mat_idx < len(materials):
                     m = materials[mat_idx]
                     mat_info = {
-                        "name": getattr(m, "name", f"材料 {mat_idx + 1}"),
+                        "name": getattr(m, "name", f"材料 {mat_idx+1}"),
                         "gamma_dry": getattr(m, "gamma_dry", "—"),
                         "gamma_sat": getattr(m, "gamma_sat", "—"),
                         "c_prime": getattr(m, "c_prime", "—"),
                         "phi_deg": getattr(m, "phi_deg", "—"),
                     }
 
-                item = LayerRegionGraphicsItem(region, poly, mat_info, region_index=r_idx)
+                item = LayerRegionGraphicsItem(region, path, mat_info, region_index=r_idx)
                 self.scene.addItem(item)
                 self._layer_items.append(item)
 

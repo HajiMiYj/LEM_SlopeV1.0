@@ -1,4 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
-  <path d="M 215,65 A 95,95 0 0,0 55,100 L 30,75 L 30,135 L 90,135 L 65,110 A 65,65 0 0,1 185,85 Z" fill="#2980b9"/>
-  <path d="M 41,191 A 95,95 0 0,0 201,156 L 226,181 L 226,121 L 166,121 L 191,146 A 65,65 0 0,1 71,171 Z" fill="#2980b9"/>
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">
+  <!-- 3/4 圆 (顺时针) -->
+  <path d="M12 4 A8 8 0 1 1 4 12"
+        fill="none" stroke="#2980b9" stroke-width="2.4" stroke-linecap="round"/>
+  <!-- 箭头 (指向下方, 表示顺时针方向) -->
+  <polygon points="1,12 7,12 4,16" fill="#2980b9"/>
 </svg>
