@@ -3291,6 +3291,34 @@ class SearchDockWidget(QDockWidget):
         self.setAllowedAreas(Qt.RightDockWidgetArea | Qt.LeftDockWidgetArea)
         self._init_ui()
 
+
+
+    def _apply_compact_style(self):
+        """让所有输入控件能被压缩, 避免内容被裁
+
+        · QDoubleSpinBox / QComboBox / QLineEdit 忽略 sizeHint, 可缩到 50px
+        · QLabel 允许裁剪, 不撑大布局
+        """
+        from PyQt5.QtWidgets import (QAbstractSpinBox, QComboBox,
+                                      QLineEdit, QSizePolicy, QLabel)
+
+        for w in self.findChildren(QAbstractSpinBox):
+            w.setMinimumWidth(50)
+            w.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        for w in self.findChildren(QComboBox):
+            w.setMinimumWidth(50)
+            w.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        for w in self.findChildren(QLineEdit):
+            w.setMinimumWidth(50)
+            w.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+
+        # QTabWidget 内的各 tab: 允许压缩
+        if hasattr(self, "tabs"):
+            self.tabs.setMinimumWidth(0)
+            for i in range(self.tabs.count()):
+                tab = self.tabs.widget(i)
+                if tab is not None:
+                    tab.setMinimumWidth(0)
     # ------------------------------------------------------------------
     # UI 构建
     # ------------------------------------------------------------------
@@ -3501,9 +3529,16 @@ class SearchDockWidget(QDockWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         scroll.setWidget(container)
         self.setWidget(scroll)
 
+        # 允许 dock 缩到 220px
+        self.setMinimumWidth(220)
+
+        # ★ 让内部控件能被压缩
+        self._apply_compact_style()
     # ------------------------------------------------------------------
     # 滑面类型切换
     # ------------------------------------------------------------------

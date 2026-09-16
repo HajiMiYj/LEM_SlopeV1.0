@@ -7,7 +7,7 @@ import os
 import csv
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QMessageBox, QStatusBar,
-    QFileDialog, QAction, QToolBar
+    QFileDialog, QAction, QToolBar, QTabWidget
 )
 from PyQt5.QtCore import Qt
 import numpy as np
@@ -74,62 +74,51 @@ class MainWindow(QMainWindow):
     # ==================================================================
     def _init_dock_widgets(self):
         # ============================================================
-        # 左侧：几何 / 材料 / 荷载  —— 全部为"建模输入"
+        # 左侧：几何 / 材料 / 荷载
         # ============================================================
         self.dock_geom = GeometryDockWidget(self)
-        self.dock_geom.geometry_changed.connect(self.on_params_changed)
-
         self.dock_mat = MaterialDockWidget(self)
+        self.dock_loads = LoadsDockWidget(self)
+
+        # ---- 信号连接 ----
+        self.dock_geom.geometry_changed.connect(self.on_params_changed)
         self.dock_mat.materials_changed.connect(self.on_params_changed)
         self.dock_geom.set_region_material_names(
-            [m.name for m in self.dock_mat.get_materials_list()]
-        )
+            [m.name for m in self.dock_mat.get_materials_list()])
         self.dock_mat.materials_changed.connect(
             lambda: self.dock_geom.set_region_material_names(
-                [m.name for m in self.dock_mat.get_materials_list()]
-            )
-        )
-
+                [m.name for m in self.dock_mat.get_materials_list()]))
         self.dock_mat.materials_changed.connect(
             lambda: self.dock_geom.clamp_material_indices(
-                len(self.dock_mat.get_materials_list())
-            )
-        )
-
-
-        self.dock_loads = LoadsDockWidget(self)
+                len(self.dock_mat.get_materials_list())))
         self.dock_loads.loads_changed.connect(self.on_params_changed)
 
         self.addDockWidget(Qt.LeftDockWidgetArea, self.dock_geom)
         self.addDockWidget(Qt.LeftDockWidgetArea, self.dock_mat)
         self.addDockWidget(Qt.LeftDockWidgetArea, self.dock_loads)
 
-        # 画布 <-> 几何面板 交互
-        self.dock_geom.polygon_draw_requested.connect(self.canvas.start_polygon_drawing)
+        # ---- 画布 <-> 几何面板 交互 ----
+        self.dock_geom.polygon_draw_requested.connect(
+            self.canvas.start_polygon_drawing)
         self.canvas.polygon_completed.connect(self.dock_geom.add_region)
-
-        self.dock_geom.strata_draw_requested.connect(self.canvas.start_polyline_drawing)
+        self.dock_geom.strata_draw_requested.connect(
+            self.canvas.start_polyline_drawing)
         self.canvas.polyline_completed.connect(self.dock_geom.apply_cut_line)
-
         self.dock_geom.strata_validation_failed.connect(self.status_bar.showMessage)
-
-        # ★ 新增: 图层树选中 → 画布高亮对应土层面
         self.dock_geom.regions_highlight_requested.connect(
-            self.canvas.set_selected_regions
-        )
+            self.canvas.set_selected_regions)
         self.canvas.regions_selection_changed.connect(
-            self.dock_geom.set_selected_regions
-        )
+            self.dock_geom.set_selected_regions)
         self.dock_geom.view_reset_requested.connect(
-            lambda: self.canvas.fit_view_to_slope(margin_ratio=0.15)
-        )
+            lambda: self.canvas.fit_view_to_slope(margin_ratio=0.15))
 
+        # ---- 三个 tabify (只显示一个, 切换看) ----
         self.tabifyDockWidget(self.dock_geom, self.dock_mat)
         self.tabifyDockWidget(self.dock_mat, self.dock_loads)
         self.dock_geom.raise_()
 
         # ============================================================
-        # 右侧：滑面寻优 / 支护 / 可靠度  —— 全部为"分析控制"
+        # 右侧：滑面寻优 / 支护 / 可靠度
         # ============================================================
         self.dock_search = SearchDockWidget(self)
         self.dock_search.preview_circle_changed.connect(self.on_params_changed)
@@ -137,20 +126,21 @@ class MainWindow(QMainWindow):
         self.dock_search.search_requested.connect(self.on_search_requested)
         self.dock_search.search_stop_requested.connect(self.on_search_stop_requested)
         self.dock_search.combo_solver.currentIndexChanged.connect(
-            lambda _: self._sync_reliability_inherit_label()
-        )
+            lambda _: self._sync_reliability_inherit_label())
 
         self.dock_reinf = ReinforcementDockWidget(self)
         self.dock_reinf.reinforcements_changed.connect(self.on_params_changed)
 
         self.dock_rel = ReliabilityDockWidget(self)
         self.dock_rel.reliability_requested.connect(self.on_reliability_requested)
-        self.dock_rel.reliability_stop_requested.connect(self.on_reliability_stop_requested)
+        self.dock_rel.reliability_stop_requested.connect(
+            self.on_reliability_stop_requested)
 
         self.addDockWidget(Qt.RightDockWidgetArea, self.dock_search)
         self.addDockWidget(Qt.RightDockWidgetArea, self.dock_reinf)
         self.addDockWidget(Qt.RightDockWidgetArea, self.dock_rel)
 
+        # ---- tabify ----
         self.tabifyDockWidget(self.dock_search, self.dock_reinf)
         self.tabifyDockWidget(self.dock_reinf, self.dock_rel)
         self.dock_search.raise_()
@@ -160,7 +150,8 @@ class MainWindow(QMainWindow):
         # ============================================================
         self.dock_rain = RainfallDockWidget(self)
         self.dock_rain.time_step_changed.connect(self.on_time_step_changed)
-        self.dock_rain.solve_time_series_requested.connect(self.on_solve_time_series)
+        self.dock_rain.solve_time_series_requested.connect(
+            self.on_solve_time_series)
 
         self.dock_results = ResultsDockWidget(self)
 
@@ -170,27 +161,43 @@ class MainWindow(QMainWindow):
         self.dock_rain.raise_()
 
         # ============================================================
-        # 面板尺寸与角落策略
+        # ★ 尺寸与行为策略
         # ============================================================
-        self.resizeDocks(
-            [self.dock_geom, self.dock_mat, self.dock_loads,
-             self.dock_search, self.dock_reinf, self.dock_rel],
-            [340, 340, 340, 380, 380, 380],
-            Qt.Horizontal
-        )
-        self.resizeDocks([self.dock_rain, self.dock_results], [180, 180], Qt.Vertical)
-
+        # 角策略: 左右各占满整列 (顶部/底部不被中央 widget 侵占)
         self.setCorner(Qt.TopLeftCorner, Qt.LeftDockWidgetArea)
         self.setCorner(Qt.BottomLeftCorner, Qt.LeftDockWidgetArea)
         self.setCorner(Qt.TopRightCorner, Qt.RightDockWidgetArea)
         self.setCorner(Qt.BottomRightCorner, Qt.RightDockWidgetArea)
 
-        self.setDockNestingEnabled(False)
+        # 允许用户自由拖动 + 嵌套 + tabify
+        self.setDockNestingEnabled(True)
         self.setDockOptions(
-            QMainWindow.AnimatedDocks | QMainWindow.AllowTabbedDocks
+            QMainWindow.AnimatedDocks
+            | QMainWindow.AllowTabbedDocks
+            | QMainWindow.AllowNestedDocks
         )
 
-        self.setMinimumSize(1280, 720)
+        # tab 标签放在顶部 (节省纵向空间, 视觉更清爽)
+        self.setTabPosition(Qt.LeftDockWidgetArea, QTabWidget.North)
+        self.setTabPosition(Qt.RightDockWidgetArea, QTabWidget.North)
+        self.setTabPosition(Qt.BottomDockWidgetArea, QTabWidget.South)
+
+        # ★ 尺寸: 尽量给画布留空间
+        # 左侧总宽 300 (tabified, 三个 dock 共享同一列宽)
+        self.resizeDocks(
+            [self.dock_geom, self.dock_mat, self.dock_loads],
+            [300, 300, 300], Qt.Horizontal)
+        # 右侧总宽 320
+        self.resizeDocks(
+            [self.dock_search, self.dock_reinf, self.dock_rel],
+            [320, 320, 320], Qt.Horizontal)
+        # 底部总高 160
+        self.resizeDocks(
+            [self.dock_rain, self.dock_results],
+            [160, 160], Qt.Vertical)
+
+        # 允许小窗 (画布至少能看)
+        self.setMinimumSize(1100, 700)
 
     # ==================================================================
     # 菜单栏 & 工具栏
