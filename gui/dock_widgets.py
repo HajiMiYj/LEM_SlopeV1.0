@@ -14,7 +14,7 @@ from PyQt5.QtWidgets import (
     QLabel, QTableWidget, QTableWidgetItem, QHeaderView, QTabWidget,
     QProgressBar, QTreeWidget, QTreeWidgetItem, QSlider,
     QScrollArea, QFrame, QCheckBox, QMessageBox, QStyledItemDelegate, QLineEdit, QAbstractItemView,
-    QInputDialog, QFileDialog
+    QInputDialog, QFileDialog, QListWidget
 )
 
 from core.materials import SoilMaterial, Distribution
@@ -515,6 +515,20 @@ class GeometryDockWidget(QDockWidget):
         indices = sorted(self.item_regions_root.indexOfChild(it)
                          for it in selected)
         self.regions_highlight_requested.emit(indices)
+
+    def clamp_material_indices(self, n_materials: int):
+        """把越界的 material_index 重定向到 0"""
+        if n_materials <= 0:
+            return
+        changed = False
+        for r in self.data_regions:
+            mi = int(r.get("material_index", 0))
+            if mi >= n_materials or mi < 0:
+                r["material_index"] = 0
+                changed = True
+        if changed:
+            self._refresh_region_tree(keep_selection=True)
+            self._emit_now()
 
     def set_selected_regions(self, indices):
         """由画布调用: 同步选中状态到图层树"""
@@ -1742,23 +1756,29 @@ class GeometryDockWidget(QDockWidget):
 
 
 class MaterialDockWidget(QDockWidget):
-    """材料库 + 深度效应 + 概率分布 + 空间云图 (联动一致性版本)"""
+    """材料库 + 深度效应 + 概率分布 + 空间云图
+
+    云图 = 深度趋势 + 空间噪声 (二者叠加)
+      · 未启用深度效应 → 趋势 = 均值 (常数)
+      · COV = 0 或 DET → 噪声 = 0
+      · 二者都开 → 显示"梯度 + 斑驳"的复合云图
+    """
 
     materials_changed = pyqtSignal()
 
     _ICON_SIZE = 20
     _BTN_SIZE = 32
 
-    # (key, 中文名, 单位, 是否非饱和, 是否深度参数, 建议下限, 建议上限)
+    # (key, 中文名, 单位, 是否非饱和, 建议下限, 建议上限)
     _DIST_ROWS = [
-        ("gamma_dist",           "γ 天然重度",    "kN/m³", False, False, 0, 40),
-        ("gamma_sat_dist",       "γsat 饱和重度",  "kN/m³", False, False, 0, 40),
-        ("c_dist",               "c' 黏聚力",      "kPa",   False, False, 0, 1000),
-        ("phi_dist",             "φ' 摩擦角",      "°",     False, False, 0, 60),
-        ("phi_b_dist",           "φb 吸力摩擦角",  "°",     True,  False, 0, 50),
-        ("suction_cutoff_dist",  "吸力截断",        "kPa",   True,  False, 0, 2000),
-        ("c_depth_rate_dist",    "c 深度增长率",    "kPa/m", False, True,  0, 100),
-        ("phi_depth_rate_dist",  "φ 深度增长率",    "°/m",   False, True,  0, 10),
+        ("gamma_dist",           "γ 天然重度",    "kN/m³", False,  0, 40),
+        ("gamma_sat_dist",       "γsat 饱和重度",  "kN/m³", False,  0, 40),
+        ("c_dist",               "c' 黏聚力",      "kPa",   False,  0, 1000),
+        ("phi_dist",             "φ' 摩擦角",      "°",     False,  0, 60),
+        ("phi_b_dist",           "φb 吸力摩擦角",  "°",     True,   0, 50),
+        ("suction_cutoff_dist",  "吸力截断",        "kPa",   True,   0, 2000),
+        ("c_depth_rate_dist",    "c 深度增长率",    "kPa/m", False,  0, 100),
+        ("phi_depth_rate_dist",  "φ 深度增长率",    "°/m",   False,  0, 10),
     ]
 
     # ==================================================================
@@ -1767,7 +1787,7 @@ class MaterialDockWidget(QDockWidget):
         self.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
 
         self.current_material_index = 0
-        self._preview_mode = "curve"
+        self._preview_mode = "curve"      # "curve" | "field"
         self._ground_pts = []
         self._layer_regions = []
         self._grid_cache_key = None
@@ -1783,13 +1803,15 @@ class MaterialDockWidget(QDockWidget):
         self._init_ui()
 
         self.materials_db = [
-            SoilMaterial("材料 1", 19.0, 21.0, 15.0, 20.0, False, 15.0, 100.0)
+            SoilMaterial("默认土层", 19.0, 21.0, 15.0, 20.0, False, 15.0, 100.0)
         ]
-        self._refresh_material_table()
+        self._refresh_material_list()
         self._load_material_params(0)
 
     # ==================================================================
-    def _icon_btn(self, icon_name, tooltip, slot):
+    # 图标按钮
+    # ==================================================================
+    def _icon_btn(self, icon_name: str, tooltip: str, slot):
         b = QPushButton()
         b.setIcon(get_icon(icon_name))
         b.setIconSize(QSize(self._ICON_SIZE, self._ICON_SIZE))
@@ -1805,12 +1827,29 @@ class MaterialDockWidget(QDockWidget):
         return b
 
     # ==================================================================
+    # 唯一名称
+    # ==================================================================
+    def _unique_name(self, base: str, exclude_idx: int = -1) -> str:
+        base = (base or "新土层").strip()
+        names = {m.name for i, m in enumerate(self.materials_db)
+                 if i != exclude_idx}
+        if base not in names:
+            return base
+        k = 2
+        while f"{base} ({k})" in names:
+            k += 1
+        return f"{base} ({k})"
+
+    # ==================================================================
+    # UI
+    # ==================================================================
     def _init_ui(self):
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
 
+        # ---------- 力学分析工况 ----------
         grp_regime = QGroupBox("力学分析工况与本构模式")
         f_regime = QFormLayout(grp_regime)
         self.combo_regime = QComboBox()
@@ -1822,18 +1861,15 @@ class MaterialDockWidget(QDockWidget):
         f_regime.addRow("分析工况:", self.combo_regime)
         layout.addWidget(grp_regime)
 
+        # ---------- 材料库 (单列列表) ----------
         grp_list = QGroupBox("材料库")
         v_list = QVBoxLayout(grp_list)
-        self.tbl_materials = QTableWidget(0, 5)
-        self.tbl_materials.setHorizontalHeaderLabels(
-            ["编号", "名称", "γ (kN/m³)", "c' (kPa)", "φ' (°)"])
-        self.tbl_materials.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.tbl_materials.setSelectionBehavior(QTableWidget.SelectRows)
-        self.tbl_materials.setSelectionMode(QTableWidget.SingleSelection)
-        self.tbl_materials.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.tbl_materials.currentCellChanged.connect(
-            lambda row, *_: self._on_material_selected(row))
-        v_list.addWidget(self.tbl_materials)
+
+        self.list_materials = QListWidget()
+        self.list_materials.setSelectionMode(QListWidget.SingleSelection)
+        self.list_materials.currentRowChanged.connect(self._on_material_row_changed)
+        self.list_materials.setMinimumHeight(120)
+        v_list.addWidget(self.list_materials)
 
         h_btns = QHBoxLayout()
         h_btns.setSpacing(6)
@@ -1842,28 +1878,33 @@ class MaterialDockWidget(QDockWidget):
         h_btns.addWidget(self._icon_btn("material_del", "删除当前材料", self._del_material))
         h_btns.addStretch()
         v_list.addLayout(h_btns)
-        layout.addWidget(grp_list, stretch=1)
+        layout.addWidget(grp_list, stretch=0)
 
+        # ---------- 当前材料 ----------
         grp_detail = QGroupBox("当前材料")
         v_detail = QVBoxLayout(grp_detail)
-        self.lbl_current_name = QLabel("—")
-        self.lbl_current_name.setStyleSheet("font-weight: bold; color: #2c3e50;")
-        v_detail.addWidget(self.lbl_current_name)
+        v_detail.setContentsMargins(6, 6, 6, 6)
+        v_detail.setSpacing(6)
 
+        # 名称行
+        h_name = QHBoxLayout()
+        h_name.addWidget(QLabel("名称:"))
+        self.edit_name = QLineEdit()
+        self.edit_name.setPlaceholderText("输入材料名称")
+        self.edit_name.editingFinished.connect(self._on_name_edit_finished)
+        h_name.addWidget(self.edit_name, 1)
+        v_detail.addLayout(h_name)
+
+        # 4 个 tab
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_tab_basic(), "基本")
         self.tabs.addTab(self._build_tab_depth(), "深度效应")
         self.tabs.addTab(self._build_tab_dist(), "概率分布")
         self.tabs.addTab(self._build_tab_preview(), "预览")
         v_detail.addWidget(self.tabs)
-
-        h_apply = QHBoxLayout()
-        h_apply.addStretch()
-        h_apply.addWidget(self._icon_btn(
-            "apply_surface", "应用当前材料参数", self._apply_current_material))
-        v_detail.addLayout(h_apply)
         layout.addWidget(grp_detail, stretch=3)
 
+        # ---------- 滚动容器 ----------
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
@@ -1884,6 +1925,7 @@ class MaterialDockWidget(QDockWidget):
             s.setSingleStep(step)
             s.setDecimals(decimals)
             s.setSuffix(suffix)
+            s.setKeyboardTracking(False)
             return s
 
         self.spin_gamma_dry = mk_spin(5, 40, 19.0, 0.1, " kN/m³")
@@ -1905,7 +1947,6 @@ class MaterialDockWidget(QDockWidget):
         f.addRow(self.grp_unsat)
         self.grp_unsat.setEnabled(False)
 
-        # 基本 tab 数值变化 → 同步到分布表
         for spin, key in ((self.spin_gamma_dry, "gamma_dist"),
                           (self.spin_gamma_sat, "gamma_sat_dist"),
                           (self.spin_c, "c_dist"),
@@ -1914,6 +1955,7 @@ class MaterialDockWidget(QDockWidget):
                           (self.spin_cutoff, "suction_cutoff_dist")):
             spin.valueChanged.connect(
                 lambda _v, k=key: self._sync_basic_to_dist(k))
+            spin.editingFinished.connect(self._flush_to_material)
         return w
 
     # ------------------------------------------------------------------
@@ -1927,28 +1969,32 @@ class MaterialDockWidget(QDockWidget):
         v.addWidget(self.chk_use_depth)
 
         f = QFormLayout()
-        self.spin_c_rate = QDoubleSpinBox()
-        self.spin_c_rate.setRange(0.0, 50.0)
-        self.spin_c_rate.setValue(0.0)
-        self.spin_c_rate.setSingleStep(0.5)
-        self.spin_c_rate.setSuffix(" kPa/m")
 
-        self.spin_phi_rate = QDoubleSpinBox()
-        self.spin_phi_rate.setRange(0.0, 5.0)
-        self.spin_phi_rate.setValue(0.0)
-        self.spin_phi_rate.setSingleStep(0.1)
-        self.spin_phi_rate.setSuffix(" °/m")
+        def mk_spin(lo, hi, val, step, suffix, decimals=2):
+            s = QDoubleSpinBox()
+            s.setRange(lo, hi)
+            s.setValue(val)
+            s.setSingleStep(step)
+            s.setDecimals(decimals)
+            s.setSuffix(suffix)
+            s.setKeyboardTracking(False)
+            return s
 
-        self.spin_depth_ref = QDoubleSpinBox()
-        self.spin_depth_ref.setRange(-100.0, 200.0)
-        self.spin_depth_ref.setValue(0.0)
-        self.spin_depth_ref.setSingleStep(0.5)
-        self.spin_depth_ref.setSuffix(" m")
+        self.spin_c_rate = mk_spin(0.0, 50.0, 0.0, 0.5, " kPa/m")
+        self.spin_phi_rate = mk_spin(0.0, 5.0, 0.0, 0.1, " °/m")
+        self.spin_depth_ref = mk_spin(-100.0, 200.0, 0.0, 0.5, " m")
 
         f.addRow("c' 随深度增长率:", self.spin_c_rate)
         f.addRow("φ' 随深度增长率:", self.spin_phi_rate)
         f.addRow("参考深度 (相对坡顶):", self.spin_depth_ref)
         v.addLayout(f)
+
+        lbl_note = QLabel(
+            "<i>注: 非饱和参数 (φb, 吸力截断) 与深度无直接关联, "
+            "不参与深度效应。</i>")
+        lbl_note.setStyleSheet("color: #7f8c8d; font-size: 11px;")
+        lbl_note.setWordWrap(True)
+        v.addWidget(lbl_note)
 
         v.addWidget(QLabel("<b>深度剖面预览:</b>"))
         self.tbl_profile = QTableWidget(0, 3)
@@ -1966,8 +2012,11 @@ class MaterialDockWidget(QDockWidget):
             x.setEnabled(False)
 
         self.chk_use_depth.stateChanged.connect(self._on_depth_toggle)
+        self.chk_use_depth.stateChanged.connect(
+            lambda _v: self._flush_to_material())
         for s in (self.spin_c_rate, self.spin_phi_rate, self.spin_depth_ref):
             s.valueChanged.connect(self._refresh_depth_profile)
+            s.editingFinished.connect(self._flush_to_material)
         return w
 
     def _on_depth_toggle(self, _=None):
@@ -2000,7 +2049,7 @@ class MaterialDockWidget(QDockWidget):
             self.tbl_profile.setItem(r, 2, QTableWidgetItem(f"{phi_val:.2f}"))
 
     # ------------------------------------------------------------------
-    # Tab 3: 概率分布 (7 列: 参数|单位|分布类型|均值|COV|下限|上限)
+    # Tab 3: 概率分布
     # ------------------------------------------------------------------
     def _build_tab_dist(self):
         w = QWidget()
@@ -2023,8 +2072,7 @@ class MaterialDockWidget(QDockWidget):
 
         self._dist_widgets = {}
 
-        for r, (key, name, unit, is_unsat, is_depth, lo, hi) in \
-                enumerate(self._DIST_ROWS):
+        for r, (key, name, unit, is_unsat, lo, hi) in enumerate(self._DIST_ROWS):
             self.tbl_dist.setItem(r, 0, QTableWidgetItem(name))
             self.tbl_dist.setItem(r, 1, QTableWidgetItem(unit))
 
@@ -2037,12 +2085,14 @@ class MaterialDockWidget(QDockWidget):
             spin_mean.setRange(-1e6, 1e6)
             spin_mean.setDecimals(3)
             spin_mean.setSingleStep(0.5)
+            spin_mean.setKeyboardTracking(False)
             self.tbl_dist.setCellWidget(r, 3, spin_mean)
 
             spin_cov = QDoubleSpinBox()
             spin_cov.setRange(0.0, 1.0)
             spin_cov.setDecimals(3)
             spin_cov.setSingleStep(0.01)
+            spin_cov.setKeyboardTracking(False)
             self.tbl_dist.setCellWidget(r, 4, spin_cov)
 
             spin_lo = QDoubleSpinBox()
@@ -2050,6 +2100,7 @@ class MaterialDockWidget(QDockWidget):
             spin_lo.setDecimals(3)
             spin_lo.setSingleStep(0.5)
             spin_lo.setValue(float(lo))
+            spin_lo.setKeyboardTracking(False)
             self.tbl_dist.setCellWidget(r, 5, spin_lo)
 
             spin_hi = QDoubleSpinBox()
@@ -2057,6 +2108,7 @@ class MaterialDockWidget(QDockWidget):
             spin_hi.setDecimals(3)
             spin_hi.setSingleStep(0.5)
             spin_hi.setValue(float(hi))
+            spin_hi.setKeyboardTracking(False)
             self.tbl_dist.setCellWidget(r, 6, spin_hi)
 
             self._dist_widgets[key] = {
@@ -2080,9 +2132,7 @@ class MaterialDockWidget(QDockWidget):
         self.chk_use_random.stateChanged.connect(self._on_random_toggle)
         return w
 
-    # ==================================================================
-    # 分布表联动
-    # ==================================================================
+    # ---------- 分布表联动 ----------
     @staticmethod
     def _set_spin(spin, value):
         spin.blockSignals(True)
@@ -2090,7 +2140,6 @@ class MaterialDockWidget(QDockWidget):
         spin.blockSignals(False)
 
     def _update_dist_row_enabled(self, key, kind):
-        """按分布类型启用/禁用各列"""
         wdg = self._dist_widgets.get(key)
         if wdg is None:
             return
@@ -2115,40 +2164,19 @@ class MaterialDockWidget(QDockWidget):
             wdg["lo"].setEnabled(True)
             wdg["hi"].setEnabled(True)
 
-    def _on_random_toggle(self, _=None):
-        """概率分布总开关"""
-        on = self.chk_use_random.isChecked()
-
-        # 分布表 enable/disable
-        self.tbl_dist.setEnabled(on)
-
-        # 写回当前材料的开关 (不改变内部参数)
-        idx = self.current_material_index
-        if 0 <= idx < len(self.materials_db):
-            self.materials_db[idx].use_random_dist = on
-
-        # 刷新预览
-        self._refresh_preview_tab()
-        if self._preview_mode == "field":
-            self._refresh_spatial_view()
-
     def _on_dist_kind_changed(self, key):
         idx = self.current_material_index
         if not (0 <= idx < len(self.materials_db)):
             return
-        m = self.materials_db[idx]
-        d = getattr(m, key, None)
-        if not isinstance(d, Distribution):
-            return
+        d = getattr(self.materials_db[idx], key, None)
         wdg = self._dist_widgets.get(key)
-        if wdg is None:
+        if not isinstance(d, Distribution) or wdg is None:
             return
 
         kind = wdg["combo"].currentData()
         d.kind = kind
 
         if kind == Distribution.DET:
-            # 固定值: 上下限归零到 mean, COV 归零
             self._set_spin(wdg["cov"], 0.0)
             self._set_spin(wdg["lo"], d.mean)
             self._set_spin(wdg["hi"], d.mean)
@@ -2157,12 +2185,13 @@ class MaterialDockWidget(QDockWidget):
             d.upper = d.mean
 
         elif kind in (Distribution.NORMAL, Distribution.LOGNORMAL):
-            # 正态/对数正态: 上下限无效, 用 None
             d.lower = None
             d.upper = None
+            s2 = 2.0 * abs(d.std) if d.cov > 0 else 0.0
+            self._set_spin(wdg["lo"], d.mean - s2)
+            self._set_spin(wdg["hi"], d.mean + s2)
 
         elif kind == Distribution.TRUNC_NORMAL:
-            # 截断正态: 保持 mean ∈ [lo, hi]
             lo = wdg["lo"].value()
             hi = wdg["hi"].value()
             if hi <= lo:
@@ -2180,7 +2209,6 @@ class MaterialDockWidget(QDockWidget):
             d.upper = hi
 
         elif kind == Distribution.UNIFORM:
-            # 均匀: 均值自动 = (lo + hi) / 2
             lo = wdg["lo"].value()
             hi = wdg["hi"].value()
             if hi <= lo:
@@ -2192,12 +2220,9 @@ class MaterialDockWidget(QDockWidget):
             d.mean = mid
             d.lower = lo
             d.upper = hi
-            if mid > 1e-9:
-                auto_cov = (hi - lo) / (2 * np.sqrt(3) * mid)
-            else:
-                auto_cov = 0.0
-            self._set_spin(wdg["cov"], auto_cov)
-            d.cov = auto_cov
+            d.cov = ((hi - lo) / (2 * np.sqrt(3) * mid)
+                     if mid > 1e-9 else 0.0)
+            self._set_spin(wdg["cov"], d.cov)
 
         self._update_dist_row_enabled(key, kind)
         self._refresh_preview_tab()
@@ -2208,18 +2233,14 @@ class MaterialDockWidget(QDockWidget):
         idx = self.current_material_index
         if not (0 <= idx < len(self.materials_db)):
             return
-        m = self.materials_db[idx]
-        d = getattr(m, key, None)
-        if not isinstance(d, Distribution):
-            return
+        d = getattr(self.materials_db[idx], key, None)
         wdg = self._dist_widgets.get(key)
-        if wdg is None:
+        if not isinstance(d, Distribution) or wdg is None:
             return
 
         v = wdg["mean"].value()
         d.mean = v
 
-        # 截断正态: 保持 mean ∈ [lo, hi]
         if d.kind == Distribution.TRUNC_NORMAL:
             lo = wdg["lo"].value()
             hi = wdg["hi"].value()
@@ -2230,7 +2251,6 @@ class MaterialDockWidget(QDockWidget):
                 self._set_spin(wdg["hi"], v)
                 d.upper = v
 
-        # 均匀: 不允许改均值 (已被禁用), 但若信号仍到达, 忽略改动
         if d.kind == Distribution.UNIFORM:
             return
 
@@ -2243,19 +2263,29 @@ class MaterialDockWidget(QDockWidget):
         idx = self.current_material_index
         if not (0 <= idx < len(self.materials_db)):
             return
-        m = self.materials_db[idx]
-        d = getattr(m, key, None)
-        if not isinstance(d, Distribution):
-            return
+        d = getattr(self.materials_db[idx], key, None)
         wdg = self._dist_widgets.get(key)
-        if wdg is None:
+        if not isinstance(d, Distribution) or wdg is None:
+            return
+
+        if d.kind in (Distribution.DET,
+                      Distribution.NORMAL,
+                      Distribution.LOGNORMAL):
+            if field == "cov":
+                d.cov = wdg["cov"].value()
+            if d.kind in (Distribution.NORMAL, Distribution.LOGNORMAL):
+                s2 = 2.0 * abs(d.std)
+                self._set_spin(wdg["lo"], d.mean - s2)
+                self._set_spin(wdg["hi"], d.mean + s2)
+            self._refresh_preview_tab()
+            if self._preview_mode == "field":
+                self._refresh_spatial_view()
             return
 
         lo = wdg["lo"].value()
         hi = wdg["hi"].value()
         mean = wdg["mean"].value()
 
-        # 上下限顺序
         if hi < lo:
             if field == "lo":
                 hi = lo
@@ -2264,7 +2294,6 @@ class MaterialDockWidget(QDockWidget):
                 lo = hi
                 self._set_spin(wdg["lo"], lo)
 
-        # 均值必须 ∈ [lo, hi]
         if mean < lo:
             if field == "lo":
                 self._set_spin(wdg["mean"], lo)
@@ -2289,16 +2318,13 @@ class MaterialDockWidget(QDockWidget):
         if field == "cov":
             d.cov = wdg["cov"].value()
 
-        # 均匀分布: 均值 = (lo + hi) / 2, COV 自动
         if d.kind == Distribution.UNIFORM:
             mid = 0.5 * (lo + hi)
             self._set_spin(wdg["mean"], mid)
             d.mean = mid
             self._sync_dist_to_basic(key, mid)
-            if mid > 1e-9:
-                d.cov = (hi - lo) / (2 * np.sqrt(3) * mid)
-            else:
-                d.cov = 0.0
+            d.cov = ((hi - lo) / (2 * np.sqrt(3) * mid)
+                     if mid > 1e-9 else 0.0)
             self._set_spin(wdg["cov"], d.cov)
 
         self._refresh_preview_tab()
@@ -2306,7 +2332,6 @@ class MaterialDockWidget(QDockWidget):
             self._refresh_spatial_view()
 
     def _sync_dist_to_basic(self, key, value):
-        """分布表的均值变化 → 同步到基本 tab"""
         mapping = {
             "gamma_dist": self.spin_gamma_dry,
             "gamma_sat_dist": self.spin_gamma_sat,
@@ -2323,7 +2348,6 @@ class MaterialDockWidget(QDockWidget):
         spin.blockSignals(False)
 
     def _sync_basic_to_dist(self, key):
-        """基本 tab 数值变化 → 分布表均值同步"""
         mapping = {
             "gamma_dist": self.spin_gamma_dry,
             "gamma_sat_dist": self.spin_gamma_sat,
@@ -2333,34 +2357,46 @@ class MaterialDockWidget(QDockWidget):
             "suction_cutoff_dist": self.spin_cutoff,
         }
         spin = mapping.get(key)
-        if spin is None:
-            return
         wdg = self._dist_widgets.get(key)
-        if wdg is None:
+        if spin is None or wdg is None:
             return
+
         v = spin.value()
         self._set_spin(wdg["mean"], v)
 
-        # 联动: 若均值越界, 拉回边界
-        lo = wdg["lo"].value()
-        hi = wdg["hi"].value()
-        if v < lo:
-            self._set_spin(wdg["lo"], v)
-        if v > hi:
-            self._set_spin(wdg["hi"], v)
+        idx = self.current_material_index
+        if not (0 <= idx < len(self.materials_db)):
+            return
+        d = getattr(self.materials_db[idx], key, None)
+        if not isinstance(d, Distribution):
+            return
+        d.mean = v
 
-        # 写入 Distribution
+        if d.kind in (Distribution.TRUNC_NORMAL, Distribution.UNIFORM):
+            lo = wdg["lo"].value()
+            hi = wdg["hi"].value()
+            if v < lo:
+                self._set_spin(wdg["lo"], v)
+                lo = v
+            if v > hi:
+                self._set_spin(wdg["hi"], v)
+                hi = v
+            d.lower = lo
+            d.upper = hi
+
+    def _on_random_toggle(self, _=None):
+        on = self.chk_use_random.isChecked()
+        self.tbl_dist.setEnabled(on)
         idx = self.current_material_index
         if 0 <= idx < len(self.materials_db):
-            d = getattr(self.materials_db[idx], key, None)
-            if isinstance(d, Distribution):
-                d.mean = v
-                d.lower = wdg["lo"].value()
-                d.upper = wdg["hi"].value()
+            self.materials_db[idx].use_random_dist = on
+        self._refresh_preview_tab()
+        if self._preview_mode == "field":
+            self._refresh_spatial_view()
 
-    # ==================================================================
+    # ------------------------------------------------------------------
     # Tab 4: 预览
-    # ==================================================================
+    # ------------------------------------------------------------------
     def _build_tab_preview(self):
         w = QWidget()
         v = QVBoxLayout(w)
@@ -2379,10 +2415,13 @@ class MaterialDockWidget(QDockWidget):
         h_top.addWidget(self.btn_view_curve)
         h_top.addWidget(self.btn_view_field)
         h_top.addStretch()
-        h_top.addWidget(self._icon_btn("apply_surface", "冻结当前实现", self._freeze_field))
-        h_top.addWidget(self._icon_btn("dist_export", "导出为 PNG", self._export_preview))
+        h_top.addWidget(self._icon_btn(
+            "apply_surface", "冻结当前实现 → 参与后续计算", self._freeze_field))
+        h_top.addWidget(self._icon_btn(
+            "dist_export", "导出当前视图为 PNG", self._export_preview))
         v.addLayout(h_top)
 
+        # 曲线模式控件
         self.w_curve_ctrl = QWidget()
         h_curve = QHBoxLayout(self.w_curve_ctrl)
         h_curve.setContentsMargins(0, 0, 0, 0)
@@ -2395,6 +2434,7 @@ class MaterialDockWidget(QDockWidget):
         h_curve.addWidget(self.combo_preview, 1)
         v.addWidget(self.w_curve_ctrl)
 
+        # 云图模式控件 (无"模式"下拉, 云图 = 趋势 + 噪声)
         self.w_field_ctrl = QWidget()
         h_field = QHBoxLayout(self.w_field_ctrl)
         h_field.setContentsMargins(0, 0, 0, 0)
@@ -2405,13 +2445,6 @@ class MaterialDockWidget(QDockWidget):
         self.combo_field_param.currentIndexChanged.connect(
             lambda _: self._refresh_spatial_view())
         h_field.addWidget(self.combo_field_param, 1)
-        h_field.addWidget(QLabel("模式:"))
-        self.combo_field_mode = QComboBox()
-        self.combo_field_mode.addItem("均值", "mean")
-        self.combo_field_mode.addItem("单次随机实现", "sample")
-        self.combo_field_mode.currentIndexChanged.connect(
-            lambda _: self._refresh_spatial_view())
-        h_field.addWidget(self.combo_field_mode)
         h_field.addWidget(QLabel("θx:"))
         self.spin_theta_x = QDoubleSpinBox()
         self.spin_theta_x.setRange(0.5, 100.0)
@@ -2435,6 +2468,14 @@ class MaterialDockWidget(QDockWidget):
         h_field.addWidget(self.spin_field_seed)
         v.addWidget(self.w_field_ctrl)
 
+        # 云图作用域提示
+        self.lbl_field_scope = QLabel("")
+        self.lbl_field_scope.setStyleSheet(
+            "color: #7f8c8d; font-size: 11px; font-style: italic;")
+        self.lbl_field_scope.setWordWrap(True)
+        self.lbl_field_scope.setVisible(False)
+        v.addWidget(self.lbl_field_scope)
+
         self.dist_plot = DistributionPlotWidget()
         v.addWidget(self.dist_plot, stretch=1)
         self.spatial_plot = SpatialFieldWidget()
@@ -2450,6 +2491,7 @@ class MaterialDockWidget(QDockWidget):
         self.btn_view_field.setChecked(mode == "field")
         self.w_curve_ctrl.setVisible(mode == "curve")
         self.w_field_ctrl.setVisible(mode == "field")
+        self.lbl_field_scope.setVisible(mode == "field")
         self.dist_plot.setVisible(mode == "curve")
         self.spatial_plot.setVisible(mode == "field")
         if mode == "curve":
@@ -2573,7 +2615,7 @@ class MaterialDockWidget(QDockWidget):
 
     @staticmethod
     def _effective_dist_stats(d):
-        """从分布抽样估计"实际生效"的 mean / std / lo / hi"""
+        """分布的"生效"统计量, 兼容所有类型与上下限"""
         if d.kind == d.DET or d.cov <= 0.0:
             m = float(d.mean)
             return m, 0.0, m, m
@@ -2585,18 +2627,34 @@ class MaterialDockWidget(QDockWidget):
         return eff_mean, eff_std, lo, hi
 
     def _refresh_spatial_view(self):
+        """云图 = 深度趋势 + 空间噪声 (二者叠加)"""
         if self._preview_mode != "field":
             return
         if not self._ground_pts or not self._layer_regions:
             self.spatial_plot.clear("未设置几何模型")
+            self.lbl_field_scope.setText("")
             return
         if not self.materials_db:
             self.spatial_plot.clear("无材料")
+            self.lbl_field_scope.setText("")
             return
 
         key, unit = self.combo_field_param.currentData()
         param_name = self.combo_field_param.currentText().split("  [")[0]
-        mode = self.combo_field_mode.currentData()
+
+        # 作用域提示
+        used_mats = set()
+        for r in self._layer_regions:
+            mi = int(r.get("material_index", 0))
+            if 0 <= mi < len(self.materials_db):
+                used_mats.add(mi)
+        if used_mats:
+            names = [f"{mi + 1}. {self.materials_db[mi].name}"
+                     for mi in sorted(used_mats)]
+            self.lbl_field_scope.setText(
+                f"云图作用域: 坡体内实际引用的材料 = {' / '.join(names)}")
+        else:
+            self.lbl_field_scope.setText("云图作用域: 无有效材料引用")
 
         gx = [p[0] for p in self._ground_pts]
         gy = [p[1] for p in self._ground_pts]
@@ -2621,6 +2679,7 @@ class MaterialDockWidget(QDockWidget):
         seed = int(self.spin_field_seed.value())
         theta_x = float(self.spin_theta_x.value())
         theta_y = float(self.spin_theta_y.value())
+        y_top = max(gy)
 
         for r_idx, mask in enumerate(region_masks):
             if mask is None or not mask.any():
@@ -2636,35 +2695,42 @@ class MaterialDockWidget(QDockWidget):
 
             eff_mean, eff_std, eff_lo, eff_hi = self._effective_dist_stats(d)
 
-            if mode == "mean":
-                if mat.use_depth_effect and key in ("c_dist", "phi_dist"):
-                    y_top = max(gy)
-                    Z = np.maximum(0.0, y_top - YY - mat.depth_ref)
-                    if key == "c_dist":
-                        field_r = mat.c_prime + mat.c_depth_rate * Z
-                    else:
-                        field_r = mat.phi_deg + mat.phi_depth_rate * Z
-                else:
-                    field_r = np.full_like(XX, eff_mean)
+            # ---- 1. 深度趋势 (整个网格) ----
+            if mat.use_depth_effect and key == "c_dist":
+                Z = np.maximum(0.0, y_top - YY - mat.depth_ref)
+                trend_map = mat.c_prime + mat.c_depth_rate * Z
+            elif mat.use_depth_effect and key == "phi_dist":
+                Z = np.maximum(0.0, y_top - YY - mat.depth_ref)
+                trend_map = mat.phi_deg + mat.phi_depth_rate * Z
             else:
-                if eff_std > 1e-12:
-                    try:
-                        from core.random_field import generate_field_on_grid
-                    except ImportError:
-                        continue
+                trend_map = np.full_like(XX, eff_mean)
+
+            # ---- 2. 空间噪声 (均值 0) ----
+            noise_map = None
+            if eff_std > 1e-12:
+                try:
+                    from core.random_field import generate_field_on_grid
                     region_seed = int(seed) * 10007 + r_idx * 7919
-                    field_r = generate_field_on_grid(
+                    noise_map = generate_field_on_grid(
                         xs, ys, theta_x=theta_x, theta_y=theta_y,
-                        mean=eff_mean, std=eff_std, seed=region_seed)
-                    field_r = np.clip(field_r, eff_lo, eff_hi)
-                else:
-                    field_r = np.full_like(XX, eff_mean)
+                        mean=0.0, std=eff_std, seed=region_seed)
+                except ImportError:
+                    noise_map = None
+
+            # ---- 3. 叠加 + clip ----
+            field_r = trend_map.copy()
+            if noise_map is not None:
+                field_r = field_r + noise_map
+
+            # 只有截断/均匀分布才 clip
+            if d.kind in (Distribution.TRUNC_NORMAL, Distribution.UNIFORM):
+                field_r = np.clip(field_r, eff_lo, eff_hi)
 
             field[mask] = field_r[mask]
 
         self._last_field = {
             "field": field.copy(), "xs": xs.copy(), "ys": ys.copy(),
-            "key": key, "mode": mode, "seed": seed,
+            "key": key, "seed": seed,
             "theta_x": theta_x, "theta_y": theta_y,
         }
         self.spatial_plot.set_data(
@@ -2672,15 +2738,11 @@ class MaterialDockWidget(QDockWidget):
             field, xs, ys, title=param_name, unit=unit)
 
     def _freeze_field(self):
-        if self._last_field is None:
-            QMessageBox.information(self, "冻结", "请先生成云图。")
+        if self._last_field is None or self._grid_cache is None:
+            QMessageBox.information(
+                self, "冻结", "请先在'空间云图'模式下生成一张图再冻结。")
             return
         lf = self._last_field
-        if lf["mode"] != "sample":
-            QMessageBox.information(
-                self, "冻结",
-                "当前是'均值'模式, 请切到'单次随机实现'后再冻结。")
-            return
         self._locked_field = {
             "xs": lf["xs"].copy(),
             "ys": lf["ys"].copy(),
@@ -2690,18 +2752,25 @@ class MaterialDockWidget(QDockWidget):
             "fields": {},
         }
         for key, *_ in self._DIST_ROWS:
-            self._locked_field["fields"][key] = self._compute_field_for_key(key)
+            f = self._compute_field_for_key(key)
+            if f is not None:
+                self._locked_field["fields"][key] = f
         QMessageBox.information(
             self, "冻结完成",
             f"已冻结当前实现 (种子={lf['seed']})。\n"
             "后续稳定性分析将使用这份场。")
 
     def _compute_field_for_key(self, key):
+        if self._grid_cache is None:
+            return None
         xs, ys, XX, YY, region_masks = self._grid_cache
         field = np.full_like(XX, np.nan, dtype=float)
         seed = int(self.spin_field_seed.value())
         theta_x = float(self.spin_theta_x.value())
         theta_y = float(self.spin_theta_y.value())
+        gx = [p[0] for p in self._ground_pts]
+        gy = [p[1] for p in self._ground_pts]
+        y_top = max(gy)
 
         for r_idx, mask in enumerate(region_masks):
             if mask is None or not mask.any():
@@ -2714,16 +2783,33 @@ class MaterialDockWidget(QDockWidget):
             d = getattr(mat, key, None)
             if not isinstance(d, Distribution):
                 continue
+
             eff_mean, eff_std, eff_lo, eff_hi = self._effective_dist_stats(d)
-            if eff_std > 1e-12:
-                from core.random_field import generate_field_on_grid
-                region_seed = int(seed) * 10007 + r_idx * 7919
-                field_r = generate_field_on_grid(
-                    xs, ys, theta_x=theta_x, theta_y=theta_y,
-                    mean=eff_mean, std=eff_std, seed=region_seed)
-                field_r = np.clip(field_r, eff_lo, eff_hi)
+
+            if mat.use_depth_effect and key == "c_dist":
+                Z = np.maximum(0.0, y_top - YY - mat.depth_ref)
+                trend_map = mat.c_prime + mat.c_depth_rate * Z
+            elif mat.use_depth_effect and key == "phi_dist":
+                Z = np.maximum(0.0, y_top - YY - mat.depth_ref)
+                trend_map = mat.phi_deg + mat.phi_depth_rate * Z
             else:
-                field_r = np.full_like(XX, eff_mean)
+                trend_map = np.full_like(XX, eff_mean)
+
+            field_r = trend_map.copy()
+            if eff_std > 1e-12:
+                try:
+                    from core.random_field import generate_field_on_grid
+                    region_seed = int(seed) * 10007 + r_idx * 7919
+                    noise_map = generate_field_on_grid(
+                        xs, ys, theta_x=theta_x, theta_y=theta_y,
+                        mean=0.0, std=eff_std, seed=region_seed)
+                    field_r = field_r + noise_map
+                except ImportError:
+                    pass
+
+            if d.kind in (Distribution.TRUNC_NORMAL, Distribution.UNIFORM):
+                field_r = np.clip(field_r, eff_lo, eff_hi)
+
             field[mask] = field_r[mask]
         return field
 
@@ -2734,22 +2820,68 @@ class MaterialDockWidget(QDockWidget):
         self._locked_field = None
 
     # ==================================================================
+    # 实时写回 (基本 + 深度 tab)
+    # ==================================================================
+    def _flush_to_material(self):
+        idx = self.current_material_index
+        if not (0 <= idx < len(self.materials_db)):
+            return
+        m = self.materials_db[idx]
+
+        m.gamma_dry = self.spin_gamma_dry.value()
+        m.gamma_sat = self.spin_gamma_sat.value()
+        m.c_prime = self.spin_c.value()
+        m.phi_deg = self.spin_phi.value()
+        m.phi_b_deg = self.spin_phib.value()
+        m.suction_cutoff = self.spin_cutoff.value()
+
+        m.use_depth_effect = self.chk_use_depth.isChecked()
+        m.c_depth_rate = self.spin_c_rate.value()
+        m.phi_depth_rate = self.spin_phi_rate.value()
+        m.depth_ref = self.spin_depth_ref.value()
+
+        self.materials_changed.emit()
+
+    def _on_name_edit_finished(self):
+        idx = self.current_material_index
+        if not (0 <= idx < len(self.materials_db)):
+            return
+        m = self.materials_db[idx]
+
+        raw = self.edit_name.text().strip()
+        if not raw:
+            self.edit_name.blockSignals(True)
+            self.edit_name.setText(m.name)
+            self.edit_name.blockSignals(False)
+            return
+
+        if raw == m.name:
+            return
+
+        # 冲突检测 (排除自身)
+        new_name = self._unique_name(raw, exclude_idx=idx)
+
+        m.name = new_name
+        self.edit_name.blockSignals(True)
+        self.edit_name.setText(m.name)
+        self.edit_name.blockSignals(False)
+
+        self._refresh_material_list()
+        self.materials_changed.emit()
+
+    # ==================================================================
     # 材料库操作
     # ==================================================================
-    def _refresh_material_table(self):
-        self.tbl_materials.blockSignals(True)
-        self.tbl_materials.setRowCount(len(self.materials_db))
-        for r, m in enumerate(self.materials_db):
-            self.tbl_materials.setItem(r, 0, QTableWidgetItem(str(r + 1)))
-            self.tbl_materials.setItem(r, 1, QTableWidgetItem(m.name))
-            self.tbl_materials.setItem(r, 2, QTableWidgetItem(f"{m.gamma_dry:.1f}"))
-            self.tbl_materials.setItem(r, 3, QTableWidgetItem(f"{m.c_prime:.1f}"))
-            self.tbl_materials.setItem(r, 4, QTableWidgetItem(f"{m.phi_deg:.1f}"))
-        self.tbl_materials.blockSignals(False)
+    def _refresh_material_list(self):
+        self.list_materials.blockSignals(True)
+        self.list_materials.clear()
+        for i, m in enumerate(self.materials_db):
+            self.list_materials.addItem(f"{i + 1}. {m.name}")
         if 0 <= self.current_material_index < len(self.materials_db):
-            self.tbl_materials.selectRow(self.current_material_index)
+            self.list_materials.setCurrentRow(self.current_material_index)
+        self.list_materials.blockSignals(False)
 
-    def _on_material_selected(self, row):
+    def _on_material_row_changed(self, row):
         if row < 0 or row >= len(self.materials_db):
             return
         if row == self.current_material_index:
@@ -2761,7 +2893,10 @@ class MaterialDockWidget(QDockWidget):
         if not (0 <= idx < len(self.materials_db)):
             return
         m = self.materials_db[idx]
-        self.lbl_current_name.setText(f"{idx + 1}. {m.name}")
+
+        self.edit_name.blockSignals(True)
+        self.edit_name.setText(m.name)
+        self.edit_name.blockSignals(False)
 
         for spin, val in ((self.spin_gamma_dry, m.gamma_dry),
                           (self.spin_gamma_sat, m.gamma_sat),
@@ -2804,10 +2939,17 @@ class MaterialDockWidget(QDockWidget):
                     break
             wdg["mean"].setValue(d.mean)
             wdg["cov"].setValue(d.cov)
-            lo_val = d.lower if d.lower is not None else d.mean
-            hi_val = d.upper if d.upper is not None else d.mean
+
+            if d.kind in (Distribution.TRUNC_NORMAL, Distribution.UNIFORM):
+                lo_val = d.lower if d.lower is not None else d.mean - 2 * abs(d.std)
+                hi_val = d.upper if d.upper is not None else d.mean + 2 * abs(d.std)
+            else:
+                s2 = 2.0 * abs(d.std)
+                lo_val = d.mean - s2
+                hi_val = d.mean + s2
             wdg["lo"].setValue(lo_val)
             wdg["hi"].setValue(hi_val)
+
             for x in (wdg["combo"], wdg["mean"], wdg["cov"],
                       wdg["lo"], wdg["hi"]):
                 x.blockSignals(False)
@@ -2821,40 +2963,20 @@ class MaterialDockWidget(QDockWidget):
         if self._preview_mode == "field":
             self._refresh_spatial_view()
 
-    def _apply_current_material(self):
-        idx = self.current_material_index
-        if not (0 <= idx < len(self.materials_db)):
-            return
-        m = self.materials_db[idx]
-
-        m.gamma_dry = self.spin_gamma_dry.value()
-        m.gamma_sat = self.spin_gamma_sat.value()
-        m.c_prime = self.spin_c.value()
-        m.phi_deg = self.spin_phi.value()
-        m.phi_b_deg = self.spin_phib.value()
-        m.suction_cutoff = self.spin_cutoff.value()
-
-        m.use_depth_effect = self.chk_use_depth.isChecked()
-        m.c_depth_rate = self.spin_c_rate.value()
-        m.phi_depth_rate = self.spin_phi_rate.value()
-        m.depth_ref = self.spin_depth_ref.value()
-
-        m.use_random_dist = self.chk_use_random.isChecked()
-
-        self._refresh_material_table()
-        self._refresh_depth_profile()
-        self._refresh_preview_tab()
-        if self._preview_mode == "field":
-            self._refresh_spatial_view()
-        self.materials_changed.emit()
-
     def _add_material(self):
-        new_idx = len(self.materials_db) + 1
+        name, ok = QInputDialog.getText(self, "新增材料", "请输入材料名称:")
+        if not ok:
+            return
+        name = (name or "").strip()
+        if not name:
+            QMessageBox.warning(self, "提示", "名称不能为空。")
+            return
+        name = self._unique_name(name)
+
         self.materials_db.append(
-            SoilMaterial(f"材料 {new_idx}", 19.0, 21.0, 15.0, 20.0,
-                         False, 15.0, 100.0))
+            SoilMaterial(name, 19.0, 21.0, 15.0, 20.0, False, 15.0, 100.0))
         self.current_material_index = len(self.materials_db) - 1
-        self._refresh_material_table()
+        self._refresh_material_list()
         self._load_material_params(self.current_material_index)
         self.materials_changed.emit()
 
@@ -2862,12 +2984,11 @@ class MaterialDockWidget(QDockWidget):
         if not (0 <= self.current_material_index < len(self.materials_db)):
             return
         src = self.materials_db[self.current_material_index]
-        new_idx = len(self.materials_db) + 1
         new_mat = SoilMaterial.from_dict(src.to_dict())
-        new_mat.name = f"材料 {new_idx} (副本)"
+        new_mat.name = self._unique_name(src.name)
         self.materials_db.append(new_mat)
         self.current_material_index = len(self.materials_db) - 1
-        self._refresh_material_table()
+        self._refresh_material_list()
         self._load_material_params(self.current_material_index)
         self.materials_changed.emit()
 
@@ -2886,7 +3007,7 @@ class MaterialDockWidget(QDockWidget):
             return
         self.materials_db.pop(self.current_material_index)
         self.current_material_index = max(0, self.current_material_index - 1)
-        self._refresh_material_table()
+        self._refresh_material_list()
         self._load_material_params(self.current_material_index)
         self.materials_changed.emit()
 
@@ -2923,7 +3044,7 @@ class MaterialDockWidget(QDockWidget):
         if layers:
             self.materials_db = [SoilMaterial.from_dict(L) for L in layers]
         if not self.materials_db:
-            self.materials_db = [SoilMaterial("材料 1")]
+            self.materials_db = [SoilMaterial("默认土层")]
 
         regime = int(data.get("active_regime", 0))
         self.combo_regime.blockSignals(True)
@@ -2955,7 +3076,7 @@ class MaterialDockWidget(QDockWidget):
                     break
 
         self._locked_field = None
-        self._refresh_material_table()
+        self._refresh_material_list()
         self._load_material_params(self.current_material_index)
 
 

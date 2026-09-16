@@ -90,6 +90,13 @@ class MainWindow(QMainWindow):
             )
         )
 
+        self.dock_mat.materials_changed.connect(
+            lambda: self.dock_geom.clamp_material_indices(
+                len(self.dock_mat.get_materials_list())
+            )
+        )
+
+
         self.dock_loads = LoadsDockWidget(self)
         self.dock_loads.loads_changed.connect(self.on_params_changed)
 
