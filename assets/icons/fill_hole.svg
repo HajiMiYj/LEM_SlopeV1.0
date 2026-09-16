@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">
+  <!-- 外框 + 内洞 (evenodd 让洞自然形成) -->
+  <path d="M3 5 L21 5 L21 20 L3 20 Z M8 10 L16 10 L16 16 L8 16 Z"
+        fill="#f3dfaa" stroke="#2c3e50" stroke-width="1.4"
+        fill-rule="evenodd"/>
+  <!-- 洞里蓝色填充 -->
+  <path d="M8 10 L16 10 L16 16 L8 16 Z"
+        fill="#3498db" fill-opacity="0.55" stroke="none"/>
+  <!-- 向下填充箭头 -->
+  <path d="M12 11 L12 15 M10 13 L12 15 L14 13"
+        fill="none" stroke="#2980b9" stroke-width="1.8"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

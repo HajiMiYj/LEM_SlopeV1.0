@@ -9,7 +9,10 @@ from core.solvers.base import BaseLEMSolver
 
 
 class FelleniusSolver(BaseLEMSolver):
+    supports_non_circular = False
     def solve(self) -> Tuple[Optional[float], str]:
+        if self.slip_surface and self.slip_surface.surface_type != "circular":
+            return None, "该算法仅限圆弧滑面"
         driving = sum(
             s.W * np.sin(s.alpha) + s.Fh * np.cos(s.alpha)
             for s in self.slices

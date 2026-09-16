@@ -14,3 +14,10 @@ __all__ = [
     "SpencerSolver",
     "MorgensternPriceSolver"
 ]
+
+FelleniusSolver.supports_non_circular = False
+BishopSolver.supports_non_circular = False
+JanbuSolver.supports_non_circular = True
+SpencerSolver.supports_non_circular = True
+MorgensternPriceSolver.supports_non_circular = True
+

@@ -5,9 +5,9 @@
 若运行环境缺少 QtSvg 格式插件，自动切换为 QPainter 纯矢量程序绘制回退，确保图标在任何平台均可稳定显示。
 """
 import os
-from PyQt5.QtWidgets import QApplication
 from PyQt5.QtGui import QIcon, QPixmap, QPainter, QPen, QBrush, QColor, QPolygon
 from PyQt5.QtCore import Qt, QPoint, QRect
+import numpy as np
 
 # 图标静态资源根目录
 ICONS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "assets", "icons"))
@@ -127,6 +127,81 @@ def _create_procedural_icon(name: str) -> QIcon:
     elif name == "apply_surface":
         p.setPen(QPen(QColor(39, 174, 96), 2.5))
         p.drawLine(4, 12, 9, 17); p.drawLine(9, 17, 20, 6)
+
+    elif name == "merge_layers":
+        # 左边土层面
+        p.setBrush(QBrush(QColor(243, 223, 170)))
+        p.setPen(QPen(QColor(44, 62, 80), 1.5))
+        poly1 = QPolygon([QPoint(2, 7), QPoint(9, 5), QPoint(9, 19), QPoint(2, 17)])
+        p.drawPolygon(poly1)
+        # 右边土层面
+        p.setBrush(QBrush(QColor(234, 212, 154)))
+        p.drawPolygon(QPolygon([QPoint(15, 5), QPoint(22, 7), QPoint(22, 17), QPoint(15, 19)]))
+        # 中间双向连接箭头
+        p.setPen(QPen(QColor(41, 128, 185), 1.8))
+        p.drawLine(9, 12, 15, 12)
+        p.drawLine(9, 12, 10, 10)
+        p.drawLine(9, 12, 10, 14)
+        p.drawLine(15, 12, 14, 10)
+        p.drawLine(15, 12, 14, 14)
+
+    elif name == "material_add":
+        p.setPen(QPen(QColor(39, 174, 96), 2))
+        p.drawEllipse(QPoint(12, 12), 8, 8)
+        p.drawLine(12, 8, 12, 16)
+        p.drawLine(8, 12, 16, 12)
+        # 小方块底座, 表示"添加到库"
+        p.setBrush(QBrush(QColor(243, 223, 170)))
+        p.setPen(QPen(QColor(44, 62, 80), 1))
+        p.drawRect(3, 18, 6, 3)
+
+    elif name == "material_copy":
+        # 两张叠放的纸
+        p.setBrush(QBrush(QColor(236, 240, 241)))
+        p.setPen(QPen(QColor(44, 62, 80), 1.5))
+        p.drawRect(4, 3, 12, 15)
+        p.setBrush(QBrush(QColor(255, 255, 255)))
+        p.drawRect(8, 7, 12, 15)
+        # 复制标记线
+        p.setPen(QPen(QColor(52, 152, 219), 1.5))
+        p.drawLine(11, 11, 17, 11)
+        p.drawLine(11, 14, 17, 14)
+        p.drawLine(11, 17, 15, 17)
+
+    elif name == "material_del":
+        # 垃圾桶
+        p.setPen(QPen(QColor(192, 57, 43), 2))
+        p.setBrush(QBrush(QColor(231, 76, 60)))
+        # 桶身
+        p.drawRect(6, 8, 12, 12)
+        # 桶盖
+        p.setBrush(QBrush(QColor(192, 57, 43)))
+        p.drawRect(5, 5, 14, 3)
+        # 提手
+        p.setPen(QPen(QColor(150, 45, 34), 1.5))
+        p.drawLine(9, 5, 11, 3)
+        p.drawLine(11, 3, 13, 3)
+        p.drawLine(13, 3, 15, 5)
+        # 竖纹
+        p.setPen(QPen(QColor(255, 255, 255, 180), 1.2))
+        p.drawLine(9, 10, 9, 18)
+        p.drawLine(12, 10, 12, 18)
+        p.drawLine(15, 10, 15, 18)
+
+    elif name == "dist_preview":
+        # 钟形曲线 (高斯 pdf)
+        p.setPen(QPen(QColor(41, 128, 185), 2))
+        path_points = []
+        for xi in range(24):
+            x = xi
+            # 高斯钟形: 中心 12, 宽度 4
+            y_pix = 20 - 14 * np.exp(-0.5 * ((xi - 12) / 3.5) ** 2)
+            path_points.append(QPoint(x, int(y_pix)))
+        for i in range(len(path_points) - 1):
+            p.drawLine(path_points[i], path_points[i + 1])
+        # 均值线
+        p.setPen(QPen(QColor(192, 57, 43), 1.2, Qt.DashLine))
+        p.drawLine(12, 4, 12, 21)
 
     else:
         p.setPen(QPen(QColor(127, 140, 141), 1))

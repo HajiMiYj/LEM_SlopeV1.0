@@ -11,6 +11,7 @@ from core.solvers.bishop import BishopSolver
 
 
 class MorgensternPriceSolver(BaseLEMSolver):
+    supports_non_circular = True
     def __init__(self, *args, interslice_func: str = "half_sine", **kwargs):
         super().__init__(*args, **kwargs)
         self.interslice_func = interslice_func

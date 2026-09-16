@@ -1,35 +1,20 @@
 # -*- coding: utf-8 -*-
 """
 土条离散剖分器模块
-支持多层地层自重积分、降雨入渗湿润锋、非饱和基质吸力表观黏聚力、坡顶超载与地震拟静力荷载
+支持多层地层自重积分、降雨入渗湿润锋、非饱和基质吸力表观黏聚力、
+坡顶超载、地震拟静力荷载、深度效应、空间随机场查表
 """
 import numpy as np
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Callable
 from core.geometry import SlopeGeometry
 from core.materials import SoilMaterial
+from core.slip_surface import BaseSlipSurface, CircularSlipSurface
 
 
 class Slice:
     """单个竖直切片土条的综合力学与几何微元对象"""
-    def __init__(
-        self,
-        index: int,
-        xm: float,
-        b: float,
-        h: float,
-        y_top: float,
-        y_base: float,
-        alpha: float,
-        l: float,
-        W: float,
-        q_load: float,
-        kh: float,
-        u: float,
-        suction: float,
-        c_total: float,
-        phi: float,
-        layer_name: str
-    ):
+    def __init__(self, index, xm, b, h, y_top, y_base, alpha, l,
+                 W, q_load, kh, u, suction, c_total, phi, layer_name):
         self.index = index
         self.xm = xm
         self.b = b
@@ -48,117 +33,169 @@ class Slice:
         self.c = c_total
         self.phi = phi
         self.layer_name = layer_name
+        self.y_cg = None  # 重心高度, 后续计算中可更新
 
 
 def create_slices(
     geom: SlopeGeometry,
     materials: List[SoilMaterial],
-    xc: float,
-    yc: float,
-    R: float,
+    xc=None,
+    yc: Optional[float] = None,
+    R: Optional[float] = None,
     n_slices: int = 30,
     rainfall_depth: float = 0.0,
-    kh: float = 0.0
+    kh: float = 0.0,
+    slip_surface: Optional[BaseSlipSurface] = None,
+    tension_crack=None,
+    anchors=None,
+    field_lookup: Optional[Callable] = None,   # ★ 新增: (key, x, y) -> float or None
+    **kwargs,
 ) -> Tuple[Optional[List[Slice]], Optional[Tuple[float, float, np.ndarray]], str]:
-    inter = geom.intersect_circle(xc, yc, R)
+    """通用边坡切片剖分器（同时支持圆弧与非圆弧折线滑面）
+
+    field_lookup 参数:
+      · None → 用材料的均值 / 深度效应算 c、φ
+      · 可调用对象 → 优先从空间场查表, 查不到再退回材料默认逻辑
+        签名: field_lookup(key: str, x: float, y: float) -> Optional[float]
+        key ∈ {"c_dist", "phi_dist", "gamma_dist", ...}
+    """
+    if n_slices < 1:
+        return None, None, "切片数必须 ≥ 1"
+
+    # 1. 统一提取滑面对象
+    if isinstance(xc, BaseSlipSurface) and slip_surface is None:
+        slip_surface = xc
+        xc = None
+
+    if slip_surface is None:
+        if xc is None or yc is None or R is None:
+            return None, None, "未指定滑面参数（需提供 slip_surface 或 xc/yc/R）"
+        slip_surface = CircularSlipSurface(float(xc), float(yc), float(R))
+
+    # 2. 滑面与地表求交
+    inter = slip_surface.get_x_range(geom.gx, geom.gy)
     if not inter:
-        return None, None, "滑弧未在边坡内部切出有效滑动体，请调整圆心或半径。"
-        
+        return None, None, "滑面未在边坡内部切出有效滑动体"
+
     x_start, x_end = inter
+    if x_end - x_start < 1e-3:
+        return None, None, f"滑面水平跨度太小: {x_end - x_start:.4f} m"
+
+    # ★ 坡顶最高点 (用于计算相对深度 z)
+    y_top_global = float(np.max(geom.gy))
+
     x_edges = np.linspace(x_start, x_end, n_slices + 1)
     slices: List[Slice] = []
+    MIN_THICKNESS = 1e-3
 
     for i in range(n_slices):
-        xl, xr = x_edges[i], x_edges[i + 1]
+        xl, xr = float(x_edges[i]), float(x_edges[i + 1])
         xm = 0.5 * (xl + xr)
         b = xr - xl
+        if b <= 0:
+            return None, None, f"第 {i+1} 条宽度非法: b={b}"
+
         y_top = geom.get_ground_elevation(xm)
-        y_base = float(yc - np.sqrt(max(0, R**2 - (xm - xc)**2)))
-        h = max(0.001, y_top - y_base)
+        y_base = slip_surface.get_y_base(xm)
 
-        sin_alpha = np.clip((xc - xm) / R, -0.9999, 0.9999)
-        alpha = float(np.arcsin(sin_alpha))
-        l = b / max(1e-4, np.cos(alpha))
+        if y_base >= y_top - 1e-6:
+            return None, None, (
+                f"滑面穿出地面: 第{i+1}条 xm={xm:.3f}, "
+                f"y_base={y_base:.4f} >= y_top={y_top:.4f}"
+            )
 
-        # 判定浸润线与降雨湿润锋位置
+        h = max(MIN_THICKNESS, y_top - y_base)
+        alpha = float(slip_surface.get_alpha(xm))
+        cos_a = np.cos(alpha)
+        if abs(cos_a) < 0.1:
+            cos_a = 0.1 if cos_a >= 0 else -0.1
+        l = b / cos_a
+
+        # 3. 水位与湿润锋
         yw = geom.get_water_elevation(xm)
-        wetting_front_y = y_top - max(0.0, rainfall_depth)
+        wetting_front_y = y_top - max(0.0, float(rainfall_depth))
 
-        # 多层地层竖向分段自重积分
-        strata_y = geom.get_strata_elevations(xm)
+        # 4. 多层地层自重积分 (用 get_layer_breakpoints 找分层)
+        strata_y = geom.get_layer_breakpoints(xm, y_base, y_top)
         div_points = [y_top]
         for sy in strata_y:
-            if y_base < sy < y_top:
-                div_points.append(sy)
+            if y_base + 1e-9 < sy < y_top - 1e-9:
+                div_points.append(float(sy))
         div_points.append(y_base)
         div_points = sorted(div_points, reverse=True)
 
         W_soil = 0.0
         for seg_idx in range(len(div_points) - 1):
-            y_high = div_points[seg_idx]
-            y_low = div_points[seg_idx + 1]
+            y_high, y_low = div_points[seg_idx], div_points[seg_idx + 1]
             seg_h = y_high - y_low
+            if seg_h <= 1e-9:
+                continue
             seg_mid_y = 0.5 * (y_high + y_low)
 
-            layer_idx = geom.get_layer_index_at(xm, seg_mid_y)
-            layer_idx = min(layer_idx, len(materials) - 1)
+            layer_idx = min(geom.get_layer_index_at(xm, seg_mid_y),
+                            len(materials) - 1)
             mat = materials[layer_idx]
 
-            # 饱和状态判定
-            is_saturated = False
-            if yw is not None and seg_mid_y <= yw:
-                is_saturated = True
-            elif seg_mid_y >= wetting_front_y and rainfall_depth > 0.0:
-                is_saturated = True
-
+            is_saturated = (
+                (yw is not None and seg_mid_y <= yw)
+                or (rainfall_depth > 0.0 and seg_mid_y >= wetting_front_y)
+            )
             use_gamma = mat.gamma_sat if is_saturated else mat.gamma_dry
             W_soil += use_gamma * b * seg_h
 
-        # 坡顶附加外荷载
-        q_val = geom.get_surcharge_at(xm)
-        q_load = q_val * b
+        # 5. 外载与孔隙水压力
+        q_load = geom.get_surcharge_at(xm) * b
 
-        # 底面孔压与基质吸力
         if yw is not None:
-            if y_base <= yw:
-                u = 9.81 * (yw - y_base)
-                suction = 0.0
-            else:
-                u = 0.0
-                suction = 9.81 * (y_base - yw)
+            u = 9.81 * (yw - y_base) if y_base <= yw else 0.0
+            suction = 9.81 * (y_base - yw) if y_base > yw else 0.0
         else:
-            u = 0.0
+            u, suction = 0.0, 0.0
+
+        if rainfall_depth > 0.0 and y_base >= wetting_front_y:
             suction = 0.0
 
-        # 若降雨湿润锋穿透至滑面，基质吸力完全消散归零
-        if y_base >= wetting_front_y and rainfall_depth > 0.0:
-            suction = 0.0
-
-        # 底面所属地层材料与表观黏聚力提取
-        base_layer_idx = geom.get_layer_index_at(xm, y_base)
-        base_layer_idx = min(base_layer_idx, len(materials) - 1)
+        # 6. 条底力学参数
+        base_layer_idx = min(geom.get_layer_index_at(xm, y_base),
+                             len(materials) - 1)
         base_mat = materials[base_layer_idx]
 
-        c_total = base_mat.get_apparent_cohesion(suction)
-        phi = base_mat.phi
+        # ★ 相对坡顶最高点的深度 (用于深度效应)
+        z_base = max(0.0, y_top_global - y_base)
 
-        slices.append(Slice(
+        # ★ 优先从空间随机场查表
+        c_val = None
+        phi_rad = None
+        if field_lookup is not None:
+            try:
+                c_val = field_lookup("c_dist", xm, y_base)
+                phi_deg_val = field_lookup("phi_dist", xm, y_base)
+                if phi_deg_val is not None:
+                    phi_rad = float(np.radians(phi_deg_val))
+            except Exception:
+                c_val = None
+                phi_rad = None
+
+        # 场查不到 → 退回材料默认逻辑
+        if c_val is None:
+            c_val = base_mat.get_apparent_cohesion(suction, z=z_base)
+        if phi_rad is None:
+            phi_rad = base_mat.get_phi_rad_at_depth(z_base)
+
+        s_obj = Slice(
             index=i + 1,
-            xm=xm,
-            b=b,
-            h=h,
-            y_top=y_top,
-            y_base=y_base,
-            alpha=alpha,
-            l=l,
-            W=W_soil,
-            q_load=q_load,
-            kh=kh,
-            u=u,
-            suction=suction,
-            c_total=c_total,
-            phi=phi,
-            layer_name=base_mat.name
-        ))
+            xm=xm, b=b, h=h, y_top=y_top, y_base=y_base,
+            alpha=alpha, l=l,
+            W=W_soil, q_load=q_load, kh=kh,
+            u=u, suction=suction,
+            c_total=float(c_val),
+            phi=float(phi_rad),
+            layer_name=base_mat.name,
+        )
+        s_obj.y_cg = 0.5 * (y_top + y_base)
+        slices.append(s_obj)
 
-    return slices, (x_start, x_end, x_edges), "多层地层与水力切片成功"
+    if not slices:
+        return None, None, "切片列表为空"
+
+    return slices, (x_start, x_end, x_edges), "切片剖分成功"

@@ -1,6 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 蒙特卡洛模拟法 (MCS) 边坡失效概率与可靠度指标求解器
+
+支持:
+  · 任意滑面 (圆弧 CircularSlipSurface / 非圆弧 PolygonalSlipSurface)
+  · 任意 LEM 求解器 (Fellenius / Bishop / Janbu / Spencer / M-P)
 """
 from typing import List, Dict, Any, Optional, Callable
 import numpy as np
@@ -9,9 +13,7 @@ from scipy.stats import norm
 from core.geometry import SlopeGeometry
 from core.materials import SoilMaterial
 from core.slicing import create_slices
-from core.solvers.bishop import BishopSolver
-from core.solvers.fellenius import FelleniusSolver
-from core.reliability.sampler import sample_soil_parameters
+from core.slip_surface import BaseSlipSurface, CircularSlipSurface
 
 
 class MonteCarloSimulator:
@@ -19,11 +21,9 @@ class MonteCarloSimulator:
         self,
         geom: SlopeGeometry,
         materials: List[SoilMaterial],
-        xc: float,
-        yc: float,
-        R: float,
+        slip_surface: BaseSlipSurface,         # ★ 改为滑面对象
         n_samples: int = 5000,
-        eval_method: str = "Bishop",
+        solver_class=None,                     # ★ 改为求解器类
         rainfall_depth: float = 0.0,
         kh: float = 0.0,
         n_slices: int = 25,
@@ -32,15 +32,12 @@ class MonteCarloSimulator:
         cov_phi: float = 0.15,
         dist_phi: str = "对数正态分布",
         rho_c_phi: float = -0.50,
-        cov_gamma: float = 0.08
+        cov_gamma: float = 0.08,
     ):
         self.geom = geom
         self.materials = materials
-        self.xc = xc
-        self.yc = yc
-        self.R = R
+        self.slip_surface = slip_surface
         self.n_samples = max(100, int(n_samples))
-        self.eval_method = eval_method
         self.rainfall_depth = rainfall_depth
         self.kh = kh
         self.n_slices = n_slices
@@ -51,28 +48,56 @@ class MonteCarloSimulator:
         self.rho_c_phi = rho_c_phi
         self.cov_gamma = cov_gamma
 
+        # 默认求解器: Bishop
+        if solver_class is None:
+            from core.solvers.bishop import BishopSolver
+            solver_class = BishopSolver
+        self.solver_class = solver_class
+
+        # 从滑面对象派生 xc / yc / R (供需要力矩中心的求解器使用)
+        self.xc, self.yc, self.R = self._derive_center_and_R()
+
+    def _derive_center_and_R(self):
+        """从滑面对象派生力矩中心与等效半径"""
+        ss = self.slip_surface
+        if getattr(ss, "surface_type", "") == "circular":
+            return float(ss.xc), float(ss.yc), float(ss.R)
+        # 非圆弧: 用几何中心 + 占位 R (run 时按切片重算)
+        try:
+            cx, cy = ss.get_moment_center()
+        except Exception:
+            cx, cy = float(np.mean(ss.px)), float(np.mean(ss.py))
+        return float(cx), float(cy), 1.0
+
     def run(
         self,
         progress_callback: Optional[Callable[[int, int, float], None]] = None,
-        is_interrupted_fn: Optional[Callable[[], bool]] = None
+        is_interrupted_fn: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
-        # 1. 对指定滑弧仅进行一次基准切片
+        # 1. 基准切片
         base_slices, info, err_msg = create_slices(
             geom=self.geom,
             materials=self.materials,
-            xc=self.xc,
-            yc=self.yc,
-            R=self.R,
+            slip_surface=self.slip_surface,
             n_slices=self.n_slices,
             rainfall_depth=self.rainfall_depth,
-            kh=self.kh
+            kh=self.kh,
         )
         if not base_slices or not info:
-            return {"success": False, "error": err_msg or "滑弧未切出有效滑体"}
+            return {"success": False, "error": err_msg or "滑面未切出有效滑体"}
 
         x_edges = info[2]
 
-        # 2. 为各土层生成独立抽样序列 (避免多层土参数混同)
+        # 2. 非圆弧滑面: 按实际切片重算等效半径 R
+        if getattr(self.slip_surface, "surface_type", "") != "circular":
+            self.R = max(
+                float(np.hypot(s.xm - self.xc, s.y_base - self.yc))
+                for s in base_slices
+            )
+            self.R = max(1.0, self.R)
+
+        # 3. 各土层独立抽样
+        from core.reliability.sampler import sample_soil_parameters
         layer_samples = []
         for mat in self.materials:
             s_dict = sample_soil_parameters(
@@ -85,11 +110,11 @@ class MonteCarloSimulator:
                 dist_phi=self.dist_phi,
                 rho_c_phi=self.rho_c_phi,
                 mean_gamma=mat.gamma_dry,
-                cov_gamma=self.cov_gamma
+                cov_gamma=self.cov_gamma,
             )
             layer_samples.append(s_dict)
 
-        # 3. 循环抽样与稳定性试算
+        # 4. 循环抽样
         fs_records = []
         failure_count = 0
         batch_report = max(50, self.n_samples // 50)
@@ -98,7 +123,7 @@ class MonteCarloSimulator:
             if is_interrupted_fn and is_interrupted_fn():
                 return {"success": False, "error": "计算被用户中断"}
 
-            # 针对每个土条，根据所属土层赋予随机参数
+            # 为每个土条赋随机参数
             for s in base_slices:
                 layer_idx = 0
                 for m_idx, m in enumerate(self.materials):
@@ -108,23 +133,30 @@ class MonteCarloSimulator:
                 samples = layer_samples[layer_idx]
                 s.c = float(samples["c"][i])
                 s.phi = float(np.radians(samples["phi_deg"][i]))
-                weight_ratio = float(samples["gamma"][i] / max(1.0, self.materials[layer_idx].gamma_dry))
+                weight_ratio = float(
+                    samples["gamma"][i] / max(1.0, self.materials[layer_idx].gamma_dry)
+                )
                 s.W = s.W_soil * weight_ratio + s.q_load
                 s.Fh = s.kh * (s.W_soil * weight_ratio)
 
-            # 调用极限平衡求解器
-            if "Fellenius" in self.eval_method:
-                solver = FelleniusSolver(base_slices, self.xc, self.yc, self.R, self.geom, x_edges)
-            else:
-                solver = BishopSolver(base_slices, self.xc, self.yc, self.R, self.geom, x_edges, tol=1e-3, max_iter=25)
+            # 用用户选择的求解器
+            try:
+                solver = self.solver_class(
+                    base_slices,
+                    self.xc, self.yc, self.R,
+                    self.geom,
+                    x_edges,
+                    slip_surface=self.slip_surface,
+                )
+                fs, _ = solver.solve()
+            except Exception:
+                fs = None
 
-            fs, _ = solver.solve()
             if fs is not None and fs > 0.01:
                 fs_records.append(fs)
                 if fs < 1.0:
                     failure_count += 1
 
-            # 阶段性回调进度
             if progress_callback and (i + 1) % batch_report == 0:
                 cur_pf = (failure_count / max(1, len(fs_records))) * 100.0
                 progress_callback(i + 1, self.n_samples, cur_pf)
@@ -132,7 +164,7 @@ class MonteCarloSimulator:
         if len(fs_records) < 10:
             return {"success": False, "error": "有效收敛样本数过低"}
 
-        # 4. 统计分析指标汇总
+        # 5. 统计
         fs_arr = np.array(fs_records, dtype=float)
         n_valid = len(fs_arr)
         pf = failure_count / n_valid
@@ -165,5 +197,5 @@ class MonteCarloSimulator:
             "fs_min": float(np.min(fs_arr)),
             "fs_max": float(np.max(fs_arr)),
             "hist_counts": counts.tolist(),
-            "hist_bins": bin_edges.tolist()
+            "hist_bins": bin_edges.tolist(),
         }

@@ -11,6 +11,7 @@ from core.solvers.bishop import BishopSolver
 
 
 class SpencerSolver(BaseLEMSolver):
+    supports_non_circular = True
     def _evaluate_residuals(self, params: np.ndarray) -> list:
         F, lam = params
         if F <= 0.1:

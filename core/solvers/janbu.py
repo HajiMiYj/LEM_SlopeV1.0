@@ -9,6 +9,8 @@ from core.solvers.base import BaseLEMSolver
 
 
 class JanbuSolver(BaseLEMSolver):
+    supports_non_circular = True
+#    原生支持非圆弧与圆弧
     def solve(self) -> Tuple[Optional[float], str]:
         driving = sum(s.W * np.tan(s.alpha) + s.Fh for s in self.slices)
         if driving <= 0:
@@ -41,6 +43,8 @@ class JanbuSolver(BaseLEMSolver):
         ratio = max_d / max(1e-4, chord_length)
 
         b1 = 0.69
-        f0 = 1.0 + b1 * (ratio - 1.4 * (ratio ** 2))
+        ratio_eff = min(ratio, 0.5)
+        f0 = 1.0 + b1 * (ratio_eff - 1.4 * (ratio_eff ** 2))
+        f0 = max(0.90, min(1.20, f0))
         fs = f0 * fs0
         return fs, f"收敛 (未修正 F0={fs0:.4f}, 经验修正系数 f0={f0:.3f})"
