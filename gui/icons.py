@@ -128,6 +128,23 @@ def _create_procedural_icon(name: str) -> QIcon:
         p.setPen(QPen(QColor(39, 174, 96), 2.5))
         p.drawLine(4, 12, 9, 17); p.drawLine(9, 17, 20, 6)
 
+    elif name == "merge_layers":
+        # 左边土层面
+        p.setBrush(QBrush(QColor(243, 223, 170)))
+        p.setPen(QPen(QColor(44, 62, 80), 1.5))
+        poly1 = QPolygon([QPoint(2, 7), QPoint(9, 5), QPoint(9, 19), QPoint(2, 17)])
+        p.drawPolygon(poly1)
+        # 右边土层面
+        p.setBrush(QBrush(QColor(234, 212, 154)))
+        p.drawPolygon(QPolygon([QPoint(15, 5), QPoint(22, 7), QPoint(22, 17), QPoint(15, 19)]))
+        # 中间双向连接箭头
+        p.setPen(QPen(QColor(41, 128, 185), 1.8))
+        p.drawLine(9, 12, 15, 12)
+        p.drawLine(9, 12, 10, 10)
+        p.drawLine(9, 12, 10, 14)
+        p.drawLine(15, 12, 14, 10)
+        p.drawLine(15, 12, 14, 14)
+
     else:
         p.setPen(QPen(QColor(127, 140, 141), 1))
         p.drawRect(4, 4, 16, 16)

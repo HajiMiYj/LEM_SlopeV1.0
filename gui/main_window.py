@@ -37,6 +37,7 @@ from gui.dock_widgets import (
 
 class MainWindow(QMainWindow):
     """边坡极限平衡分析系统主窗口 (QDockWidget 模块化架构)"""
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("边坡极限平衡法稳定性分析平台 (LEM-Slope-Studio)")
@@ -106,7 +107,15 @@ class MainWindow(QMainWindow):
         self.dock_geom.strata_validation_failed.connect(self.status_bar.showMessage)
 
         # ★ 新增: 图层树选中 → 画布高亮对应土层面
-        self.dock_geom.region_highlight_requested.connect(self.canvas.highlight_region)
+        self.dock_geom.regions_highlight_requested.connect(
+            self.canvas.set_selected_regions
+        )
+        self.canvas.regions_selection_changed.connect(
+            self.dock_geom.set_selected_regions
+        )
+        self.dock_geom.view_reset_requested.connect(
+            lambda: self.canvas.fit_view_to_slope(margin_ratio=0.15)
+        )
 
         self.tabifyDockWidget(self.dock_geom, self.dock_mat)
         self.tabifyDockWidget(self.dock_mat, self.dock_loads)
@@ -164,9 +173,9 @@ class MainWindow(QMainWindow):
         )
         self.resizeDocks([self.dock_rain, self.dock_results], [180, 180], Qt.Vertical)
 
-        self.setCorner(Qt.TopLeftCorner,     Qt.LeftDockWidgetArea)
-        self.setCorner(Qt.BottomLeftCorner,  Qt.LeftDockWidgetArea)
-        self.setCorner(Qt.TopRightCorner,    Qt.RightDockWidgetArea)
+        self.setCorner(Qt.TopLeftCorner, Qt.LeftDockWidgetArea)
+        self.setCorner(Qt.BottomLeftCorner, Qt.LeftDockWidgetArea)
+        self.setCorner(Qt.TopRightCorner, Qt.RightDockWidgetArea)
         self.setCorner(Qt.BottomRightCorner, Qt.RightDockWidgetArea)
 
         self.setDockNestingEnabled(False)
@@ -175,6 +184,7 @@ class MainWindow(QMainWindow):
         )
 
         self.setMinimumSize(1280, 720)
+
     # ==================================================================
     # 菜单栏 & 工具栏
     # ==================================================================
@@ -339,6 +349,8 @@ class MainWindow(QMainWindow):
             self.dock_geom.get_snap_mode(),
         )
 
+        # self.canvas.set_hatch_scale(self.dock_geom.get_hatch_scale())
+
         self.canvas.render_model(
             ground_x=ground_x,
             ground_y=ground_y,
@@ -350,10 +362,12 @@ class MainWindow(QMainWindow):
             surcharge_loads=surcharge,
             slip_surface=slip_surface,
             reinforcements=self.dock_reinf.get_reinforcements(),
-            materials=materials,      # ★ 新增: 让土层面 tooltip 能显示材料信息
+            materials=materials,  # ★ 新增: 让土层面 tooltip 能显示材料信息
+            bottom_depth=self.dock_geom.get_bottom_depth(),
         )
         self.dock_results.display_slices(self.current_slices)
         self.status_bar.showMessage(msg)
+
     def on_time_step_changed(self, t: float):
         self.on_params_changed()
         self.status_bar.showMessage(f"已切换至降雨历时 t = {t:.1f} h，湿润锋深度已动态更新。")
@@ -765,7 +779,7 @@ class MainWindow(QMainWindow):
                 project_name=self.windowTitle().split("(")[0].strip() or "未命名工程",
                 ground_pts=ground_pts,
                 water_pts=water_pts,
-                layer_regions=layer_regions,   # ★ 新参数
+                layer_regions=layer_regions,  # ★ 新参数
                 materials=materials,
                 surcharge_loads=surcharge,
                 kh=kh,
@@ -802,7 +816,7 @@ class MainWindow(QMainWindow):
         self.dock_geom.from_dict({
             "ground": default_ground,
             "water": default_water,
-            "regions": [],       # ★ 空 → from_dict 自动生成默认大面
+            "regions": [],  # ★ 空 → from_dict 自动生成默认大面
         })
 
         self.dock_mat.from_dict({
@@ -955,7 +969,7 @@ class MainWindow(QMainWindow):
         ok = export_model_dxf(
             filepath=fpath,
             ground_pts=ground_pts,
-            strata_lines=strata_out,       # 兼容旧签名
+            strata_lines=strata_out,  # 兼容旧签名
             water_pts=water_pts,
         )
         if ok:

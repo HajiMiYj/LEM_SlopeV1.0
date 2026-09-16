@@ -8,11 +8,16 @@ from PyQt5.QtWidgets import (
     QGraphicsPathItem, QGraphicsLineItem, QGraphicsRectItem,
     QGraphicsEllipseItem
 )
-from PyQt5.QtGui import QPen, QBrush, QColor, QPainter, QPolygonF, QPainterPath, QPixmap
+from PyQt5.QtGui import QPen, QBrush, QColor, QPainter, QPolygonF, QPainterPath, QPixmap, QTransform
 from PyQt5.QtCore import Qt, QPointF, QRectF, QLineF, pyqtSignal
 
+
+# ======================================================================
+# 土条图元: 悬停高亮 + 力学物理量 Tooltip
+# ======================================================================
 class SliceGraphicsItem(QGraphicsPolygonItem):
     """具有悬停高亮与力学物理量 Tooltip 的土条交互图元"""
+
     def __init__(self, slice_data, polygon: QPolygonF):
         super().__init__(polygon)
         self.slice_data = slice_data
@@ -58,156 +63,253 @@ class SliceGraphicsItem(QGraphicsPolygonItem):
         super().hoverLeaveEvent(event)
 
 
+# ======================================================================
+# 填充图案工厂 (保持原样)
+# ======================================================================
 class HatchPatternFactory:
     """按岩土工程制图规范生成填充画刷
 
-    支持图案:
-      · solid        纯色
-      · clay         黏土 - 45° 斜线
-      · silt         粉质黏土 - 竖短线 + 点
-      · sand         砂土 - 密集点
-      · gravel       砾石 - 交叉网格 + 圆点
-      · rock_strong  强风化岩 - 交叉斜线
-      · rock_medium  中风化岩 - 单向斜线
-      · rock_fresh   新鲜岩石 - 小三角形
-      · fill         素填土 - 稀疏点
+    ★ 关键设计: pixmap 尺寸由 view 缩放在 paint() 时动态决定,
+      保证图案在屏幕上 1:1 像素映射 (不糊)。
     """
-
-    _cache = {}   # 缓存 QPixmap, 避免每次重建
+    _cache = {}
 
     @classmethod
-    def make_brush(cls, pattern_id: str, base_color: QColor) -> QBrush:
-        # ---- 简单图案: 直接用 Qt 内置 ----
+    def make_brush(cls, pattern_id: str, base_color: QColor,
+                   pix_size: int) -> QBrush:
         if pattern_id == "solid":
             return QBrush(base_color, Qt.SolidPattern)
-        if pattern_id == "sand":
-            return QBrush(base_color, Qt.Dense6Pattern)
-        if pattern_id == "rock_strong":
-            return QBrush(base_color, Qt.DiagCrossPattern)
-        if pattern_id == "rock_medium":
-            return QBrush(base_color, Qt.BDiagPattern)
-        if pattern_id == "fill":
-            return QBrush(base_color, Qt.Dense4Pattern)
 
-        # ---- 复杂图案: 用 QPixmap 绘制纹理 ----
-        cache_key = (pattern_id, base_color.name())
-        if cache_key in cls._cache:
-            return QBrush(cls._cache[cache_key])
+        pix_size = max(8, min(128, int(pix_size)))
+        key = (pattern_id, base_color.name(), pix_size)
+        if key in cls._cache:
+            return QBrush(cls._cache[key])
 
-        pix = QPixmap(24, 24)
+        pix = QPixmap(pix_size, pix_size)
         pix.fill(base_color)
 
-        painter = QPainter(pix)
-        painter.setRenderHint(QPainter.Antialiasing)
+        painter = QPainter()
+        try:
+            if not painter.begin(pix):
+                return QBrush(base_color, Qt.SolidPattern)
+            painter.setRenderHint(QPainter.Antialiasing)
 
-        fg = base_color.darker(160)
-        pen = QPen(fg, 1.0)
-        pen.setCosmetic(True)
-        painter.setPen(pen)
+            fg = base_color.darker(170)
+            n = pix_size
+            pen_w = max(1.0, n / 40.0)
+            painter.setPen(QPen(fg, pen_w))
 
-        if pattern_id == "clay":
-            # 45° 斜线, 间距 6px
-            for i in range(-24, 48, 6):
-                painter.drawLine(i, 0, i + 24, 24)
+            if pattern_id == "clay":
+                step = max(8, n // 2)
+                for i in range(-n, 2 * n, step):
+                    painter.drawLine(QPointF(i, 0), QPointF(i + n, n))
 
-        elif pattern_id == "silt":
-            # 竖向短线 + 底部小点
-            for x in range(4, 24, 8):
-                painter.drawLine(x, 4, x, 16)
-            painter.setBrush(fg)
-            painter.setPen(Qt.NoPen)
-            for x in range(8, 24, 8):
-                painter.drawEllipse(QPointF(x, 20), 1.0, 1.0)
+            elif pattern_id == "silt":
+                step = max(6, n // 3)
+                for x in range(step, n, step):
+                    painter.drawLine(QPointF(x, n * 0.15), QPointF(x, n * 0.75))
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(fg))
+                r = max(0.8, n * 0.04)
+                for x in range(step + step // 2, n, step):
+                    painter.drawEllipse(QPointF(x, n * 0.88), r, r)
 
-        elif pattern_id == "gravel":
-            # 交叉网格 + 4 个圆点
-            for i in range(-24, 48, 8):
-                painter.drawLine(i, 0, i + 24, 24)
-                painter.drawLine(i, 24, i + 24, 0)
-            painter.setBrush(fg)
-            painter.setPen(Qt.NoPen)
-            for x in (6, 18):
-                for y in (6, 18):
-                    painter.drawEllipse(QPointF(x, y), 1.2, 1.2)
+            elif pattern_id == "sand":
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(fg))
+                r = max(1.0, n * 0.05)
+                for xi in (0.25, 0.75):
+                    for yi in (0.25, 0.75):
+                        painter.drawEllipse(QPointF(n * xi, n * yi), r, r)
 
-        elif pattern_id == "rock_fresh":
-            # 小三角形排列
-            painter.setBrush(Qt.NoBrush)
-            for y in (3, 13):
-                for x in (3, 13):
-                    painter.drawPolygon(
-                        QPointF(x, y),
-                        QPointF(x + 5, y),
-                        QPointF(x + 2.5, y + 5),
-                    )
-        else:
-            # 未知图案 → 退化到纯色
-            painter.end()
+            elif pattern_id == "fill":
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(fg))
+                r = max(1.0, n * 0.04)
+                for xi in (0.3, 0.8):
+                    for yi in (0.3, 0.8):
+                        painter.drawEllipse(QPointF(n * xi, n * yi), r, r)
+
+            elif pattern_id == "gravel":
+                step = max(8, n // 2)
+                for i in range(-n, 2 * n, step):
+                    painter.drawLine(QPointF(i, 0), QPointF(i + n, n))
+                    painter.drawLine(QPointF(i, n), QPointF(i + n, 0))
+
+            elif pattern_id == "rock_strong":
+                step = max(6, n // 3)
+                for i in range(-n, 2 * n, step):
+                    painter.drawLine(QPointF(i, 0), QPointF(i + n, n))
+                    painter.drawLine(QPointF(i, n), QPointF(i + n, 0))
+
+            elif pattern_id == "rock_medium":
+                step = max(8, n // 2)
+                for i in range(-n, 2 * n, step):
+                    painter.drawLine(QPointF(i, 0), QPointF(i + n, n))
+
+            elif pattern_id == "rock_fresh":
+                painter.setBrush(QBrush(Qt.NoBrush))
+                tri = n * 0.35
+                for xi, yi in ((0.1, 0.1), (0.55, 0.1), (0.1, 0.55), (0.55, 0.55)):
+                    x0, y0 = n * xi, n * yi
+                    poly = QPolygonF([
+                        QPointF(x0, y0),
+                        QPointF(x0 + tri, y0),
+                        QPointF(x0 + tri / 2, y0 + tri),
+                    ])
+                    painter.drawPolygon(poly)
+
+            else:
+                return QBrush(base_color, Qt.SolidPattern)
+
+        except Exception:
             return QBrush(base_color, Qt.SolidPattern)
+        finally:
+            try:
+                if painter.isActive():
+                    painter.end()
+            except Exception:
+                pass
 
-        painter.end()
-        cls._cache[cache_key] = pix
+        if len(cls._cache) > 64:
+            cls._cache.clear()
+        cls._cache[key] = pix
         return QBrush(pix)
 
+
+# ======================================================================
+# 土层面图元: 填充 + hover / 选中高亮 + Tooltip + 点击通知
+# ======================================================================
 class LayerRegionGraphicsItem(QGraphicsPathItem):
     """土层面图元 (带洞 + 规范填充 + hover / 选中高亮 + Tooltip)
 
-    继承 QGraphicsPathItem, 支持带洞多边形 (OddEvenFill)。
+    · 三种视觉状态: default / hovered / selected
+    · 左键点击 → 通知所属 View 处理选中 (支持 Ctrl 多选)
     """
 
-    def __init__(self, region_data, path, material_info=None, region_index=-1):
+    def __init__(self, region_data, path, material_info=None,
+                 region_index=-1, tile_m=4.0):
         super().__init__(path)
         self.region_data = region_data
         self.material_info = material_info or {}
         self.region_index = region_index
+        self._tile_m = max(0.5, float(tile_m))
 
-        base_color = QColor(region_data.get("color", "#f3dfaa"))
-        pattern = region_data.get("pattern", "solid")
+        self._base_color = QColor(region_data.get("color", "#f3dfaa"))
+        self._pattern = region_data.get("pattern", "solid")
 
-        # ---- 常态画刷 (规范填充) ----
-        self.default_brush = HatchPatternFactory.make_brush(pattern, base_color)
-        self.default_pen = QPen(base_color.darker(160), 1.5)
+        self.default_pen = QPen(self._base_color.darker(160), 1.5)
         self.default_pen.setCosmetic(True)
-
-        # ---- 悬停画刷 (提亮 + 蓝色边框) ----
-        hover_color = QColor(base_color).lighter(115)
-        self.hover_brush = HatchPatternFactory.make_brush(pattern, hover_color)
         self.hover_pen = QPen(QColor(41, 128, 185), 2.5)
         self.hover_pen.setCosmetic(True)
-
-        # ---- 选中画刷 (加亮 + 红色粗边框) ----
-        sel_color = QColor(base_color).lighter(130)
-        self.selected_brush = HatchPatternFactory.make_brush(pattern, sel_color)
         self.selected_pen = QPen(QColor(192, 57, 43), 3.0)
         self.selected_pen.setCosmetic(True)
 
         self._hovered = False
         self._selected = False
 
-        self.setBrush(self.default_brush)
         self.setPen(self.default_pen)
+        self.setBrush(QBrush(Qt.NoBrush))
         self.setAcceptHoverEvents(True)
-
         self._build_tooltip()
 
-    # ==================================================================
+    # ------------------------------------------------------------------
+    # 重写 paint
+    # ------------------------------------------------------------------
+    def paint(self, painter, option, widget=None):
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        # 1. 底色 + 图案 (在 path 裁剪区内)
+        painter.save()
+        painter.setClipPath(self.path())
+        painter.fillPath(self.path(), QBrush(self._base_color))
+        if self._pattern != "solid":
+            self._paint_hatch(painter)
+        painter.restore()
+
+        # 2. 边框
+        if self._selected:
+            pen = self.selected_pen
+        elif self._hovered:
+            pen = self.hover_pen
+        else:
+            pen = self.default_pen
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawPath(self.path())
+
+    def _paint_hatch(self, painter):
+        # view 缩放 (屏幕像素 / 场景米)
+        scale = 1.0
+        try:
+            views = self.scene().views() if self.scene() else []
+            if views:
+                scale = abs(views[0].transform().m11())
+        except Exception:
+            scale = 1.0
+        scale = max(scale, 0.05)
+
+        # pixmap 尺寸 = tile 在屏幕上的像素数 (1:1 映射 → 不糊)
+        T = self._tile_m
+        P = int(T * scale)
+        P = max(8, min(128, P))
+
+        brush = HatchPatternFactory.make_brush(
+            self._pattern, self._base_color, P)
+
+        # brush 缩放: pixmap P 像素 → 场景 T 米
+        t = QTransform()
+        t.scale(T / P, T / P)
+        brush.setTransform(t)
+
+        painter.fillPath(self.path(), brush)
+
+    # ------------------------------------------------------------------
+    # 事件
+    # ------------------------------------------------------------------
+    def hoverEnterEvent(self, event):
+        self._hovered = True
+        self.update()
+        super().hoverEnterEvent(event)
+
+    def hoverLeaveEvent(self, event):
+        self._hovered = False
+        self.update()
+        super().hoverLeaveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            scene = self.scene()
+            if scene is not None:
+                for v in scene.views():
+                    if hasattr(v, "_handle_region_click"):
+                        v._handle_region_click(self.region_index,
+                                               event.modifiers())
+                        break
+        super().mousePressEvent(event)
+
+    def set_selected(self, flag):
+        self._selected = bool(flag)
+        self.update()
+
+    # ------------------------------------------------------------------
     # Tooltip
-    # ==================================================================
+    # ------------------------------------------------------------------
     def _build_tooltip(self):
         name = self.region_data.get("name", "土层面")
         mat = self.material_info
         mat_name = mat.get("name", "—")
 
         pattern_cn = {
-            "solid":        "纯色",
-            "clay":         "45°斜线 (黏土)",
-            "silt":         "竖短线+点 (粉质黏土)",
-            "sand":         "点状 (砂土)",
-            "gravel":       "交叉网格 (砾石)",
-            "rock_strong":  "交叉斜线 (强风化岩)",
-            "rock_medium":  "单向斜线 (中风化岩)",
-            "rock_fresh":   "三角符号 (新鲜岩石)",
-            "fill":         "稀疏点 (素填土)",
+            "solid": "纯色",
+            "clay": "45°斜线 (黏土)",
+            "silt": "竖短线+点 (粉质黏土)",
+            "sand": "点状 (砂土)",
+            "gravel": "交叉网格 (砾石)",
+            "rock_strong": "交叉斜线 (强风化岩)",
+            "rock_medium": "单向斜线 (中风化岩)",
+            "rock_fresh": "三角符号 (新鲜岩石)",
+            "fill": "稀疏点 (素填土)",
         }.get(self.region_data.get("pattern", "solid"), "—")
 
         lines = [
@@ -235,9 +337,9 @@ class LayerRegionGraphicsItem(QGraphicsPathItem):
             "color: #2c3e50;'>" + "<br>".join(lines) + "</div>"
         )
 
-    # ==================================================================
+    # ------------------------------------------------------------------
     # 状态刷新
-    # ==================================================================
+    # ------------------------------------------------------------------
     def _refresh_style(self):
         if self._selected:
             self.setBrush(self.selected_brush)
@@ -249,32 +351,18 @@ class LayerRegionGraphicsItem(QGraphicsPathItem):
             self.setBrush(self.default_brush)
             self.setPen(self.default_pen)
 
-    # ==================================================================
-    # 事件
-    # ==================================================================
-    def hoverEnterEvent(self, event):
-        self._hovered = True
-        self._refresh_style()
-        super().hoverEnterEvent(event)
 
-    def hoverLeaveEvent(self, event):
-        self._hovered = False
-        self._refresh_style()
-        super().hoverLeaveEvent(event)
-
-    # ==================================================================
-    # 外部接口
-    # ==================================================================
-    def set_selected(self, flag):
-        """图层树选中时调用, flag=True 高亮"""
-        self._selected = bool(flag)
-        self._refresh_style()
-
+# ======================================================================
+# 主视口
+# ======================================================================
 class SlopeGraphicsView(QGraphicsView):
     """基于 PyQt5 QGraphicsView 的专业 CAD 级交互视口"""
+
     polygon_completed = pyqtSignal(list)
     polyline_completed = pyqtSignal(list)
     drawing_status = pyqtSignal(str)
+    # 画布侧选中集变化 → 通知外部 (list of region_index)
+    regions_selection_changed = pyqtSignal(list)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -284,8 +372,8 @@ class SlopeGraphicsView(QGraphicsView):
         self.setRenderHint(QPainter.Antialiasing)
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.AnchorUnderMouse)
-
-        self.scale(1, -1)
+        self._hatch_scale = 1.0
+        self.scale(1, -1)  # Y 轴翻转, 符合工程坐标直觉
         self.setBackgroundBrush(QBrush(QColor(250, 252, 255)))
 
         # ---- 平移 ----
@@ -294,33 +382,89 @@ class SlopeGraphicsView(QGraphicsView):
 
         # ---- 绘制模式 ----
         self._drawing_polygon = False
-        self._drawing_mode = None          # "polygon" | "polyline"
+        self._drawing_mode = None  # "polygon" | "polyline"
         self._polygon_points = []
         self._drawing_item = None
         self._preview_cursor = None
 
         # ---- 吸附 ----
-        self._snap_tol = 0.5
-        self._snap_mode = "both"           # "none" | "point" | "line" | "both"
-        self._snap_points = []             # [(x, y), ...]
-        self._snap_segments = []           # [((x1,y1),(x2,y2)), ...]
-
-        # ---- 土层面 ----
-        self._layer_items = []             # [LayerRegionGraphicsItem, ...]
+        self._snap_tol = 0.5  # 场景单位 (米), 由外部设置
+        self._snap_mode = "both"  # "none" | "point" | "line" | "both"
+        self._snap_points = []
+        self._snap_segments = []
         self._snap_marker = None
 
+        # ---- 土层面 ----
+        self._layer_items = []
+        self._selected_regions = set()  # 当前选中的 region_index 集合
+
     # ==================================================================
-    # 对外设置接口
+    # 基本设置
     # ==================================================================
+    def set_hatch_scale(self, scale: float):
+        self._hatch_scale = float(scale)
+
     def set_snap_options(self, tol: float, mode: str):
         """设置吸附容差 (米) 和吸附模式"""
         self._snap_tol = float(tol)
         self._snap_mode = str(mode)
 
-    def highlight_region(self, region_index: int):
-        """高亮指定土层面, -1 取消所有高亮"""
+    # ==================================================================
+    # 土层面选中管理 (图层树 ↔ 画布 双向同步)
+    # ==================================================================
+    def set_selected_regions(self, indices):
+        """外部 (图层树) 设置选中集合, 不发射信号, 避免回环"""
+        try:
+            new_set = set(int(i) for i in (indices or []) if int(i) >= 0)
+        except (TypeError, ValueError):
+            new_set = set()
+
+        if new_set == self._selected_regions:
+            return
+        self._selected_regions = new_set
+        self._apply_region_selection()
+
+    def _apply_region_selection(self):
+        """把 _selected_regions 应用到实际图元 (RuntimeError 兜底)"""
         for item in self._layer_items:
-            item.set_selected(item.region_index == region_index)
+            try:
+                item.set_selected(item.region_index in self._selected_regions)
+            except RuntimeError:
+                # scene.clear() 后 C++ 端已销毁, 忽略
+                pass
+            except Exception:
+                pass
+
+    def _handle_region_click(self, idx, modifiers):
+        """画布上点击某个土层面:
+          · 无修饰键 → 单选
+          · Ctrl     → toggle 该面
+          · Shift    → 从当前选中范围扩大到 idx
+        """
+        ctrl = bool(modifiers & Qt.ControlModifier)
+        shift = bool(modifiers & Qt.ShiftModifier)
+
+        if ctrl:
+            if idx in self._selected_regions:
+                self._selected_regions.discard(idx)
+            else:
+                self._selected_regions.add(idx)
+        elif shift and self._selected_regions:
+            lo = min(min(self._selected_regions), idx)
+            hi = max(max(self._selected_regions), idx)
+            self._selected_regions = set(range(lo, hi + 1))
+        else:
+            self._selected_regions = {idx}
+
+        self._apply_region_selection()
+        self.regions_selection_changed.emit(sorted(self._selected_regions))
+
+    def highlight_region(self, region_index):
+        """兼容旧接口: 单值高亮 / <0 取消所有"""
+        if region_index is None or region_index < 0:
+            self.set_selected_regions([])
+        else:
+            self.set_selected_regions([region_index])
 
     # ==================================================================
     # 绘制模式控制
@@ -331,7 +475,9 @@ class SlopeGraphicsView(QGraphicsView):
         self._polygon_points = []
         self._drawing_item = None
         self.setCursor(Qt.CrossCursor)
-        self.drawing_status.emit("绘制土层面：左键加点，双击闭合，Backspace 撤销，Esc 取消")
+        self.drawing_status.emit(
+            "绘制土层面：左键加点，点击起点附近闭合，右键结束，Backspace 撤销，Esc 取消"
+        )
 
     def start_polyline_drawing(self):
         self._drawing_polygon = True
@@ -339,14 +485,16 @@ class SlopeGraphicsView(QGraphicsView):
         self._polygon_points = []
         self._drawing_item = None
         self.setCursor(Qt.CrossCursor)
-        self.drawing_status.emit("绘制切割线：左键加点，双击或右键结束，Backspace 撤销，Esc 取消")
+        self.drawing_status.emit(
+            "绘制切割线：左键加点，右键结束，Backspace 撤销，Esc 取消"
+        )
 
     def cancel_polygon_drawing(self):
         self._drawing_polygon = False
         self._drawing_mode = None
         self._polygon_points = []
         self._clear_drawing_preview()
-        self._clear_snap_marker() 
+        self._clear_snap_marker()
         self.setCursor(Qt.ArrowCursor)
         self._preview_cursor = None
 
@@ -432,32 +580,26 @@ class SlopeGraphicsView(QGraphicsView):
     # 吸附
     # ==================================================================
     def _snap_to_nearest(self, screen_pos, scene_pos):
-        """screen_pos: QPoint 屏幕坐标; scene_pos: QPointF 场景坐标"""
-        if self._snap_mode == "none":
+        """用场景坐标做吸附比较, 容差用 UI 传入的 _snap_tol (米)
+
+        返回 (snapped_QPointF, snap_type)
+        """
+        if self._snap_mode == "none" or self._snap_tol <= 0.0:
             return scene_pos, None
 
-        # 屏幕像素容差
-        snap_px = 15
-
+        tol = self._snap_tol
         best = None
-        best_dist_px = snap_px
+        best_d2 = tol * tol
         best_type = None
 
-        # 收集所有候选点(场景坐标),转成屏幕坐标比较
-        candidates = []
-        
-        # 吸附点
         if self._snap_mode in ("point", "both"):
             for (px, py) in self._snap_points:
-                sp = self.mapFromScene(QPointF(px, py))
-                d_px = ((sp.x() - screen_pos.x()) ** 2 +
-                        (sp.y() - screen_pos.y()) ** 2) ** 0.5
-                if d_px < best_dist_px:
-                    best_dist_px = d_px
+                d2 = (px - scene_pos.x()) ** 2 + (py - scene_pos.y()) ** 2
+                if d2 < best_d2:
+                    best_d2 = d2
                     best = (px, py)
                     best_type = "point"
 
-        # 吸附线
         if self._snap_mode in ("line", "both"):
             for ((x1, y1), (x2, y2)) in self._snap_segments:
                 dx, dy = x2 - x1, y2 - y1
@@ -467,33 +609,25 @@ class SlopeGraphicsView(QGraphicsView):
                 t = ((scene_pos.x() - x1) * dx + (scene_pos.y() - y1) * dy) / L2
                 t = max(0.0, min(1.0, t))
                 cx, cy = x1 + t * dx, y1 + t * dy
-                sp = self.mapFromScene(QPointF(cx, cy))
-                d_px = ((sp.x() - screen_pos.x()) ** 2 +
-                        (sp.y() - screen_pos.y()) ** 2) ** 0.5
-                if d_px < best_dist_px:
-                    best_dist_px = d_px
+                d2 = (cx - scene_pos.x()) ** 2 + (cy - scene_pos.y()) ** 2
+                if d2 < best_d2:
+                    best_d2 = d2
                     best = (cx, cy)
                     best_type = "line"
 
         if best is not None:
             return QPointF(best[0], best[1]), best_type
         return scene_pos, None
-    
+
     def _update_snap_marker(self, scene_pos, snap_type):
-        """在吸附位置画一个小圆点提示用户"""
         self._clear_snap_marker()
         if snap_type is None:
             return
 
-        # 场景单位下的圆半径 (让它视觉上约 4 像素)
-        # 用当前缩放比例反推
         scale_factor = self.transform().m11()
-        if abs(scale_factor) < 1e-6:
-            r = 0.3
-        else:
-            r = 4.0 / abs(scale_factor)
+        r = 0.3 if abs(scale_factor) < 1e-6 else 4.0 / abs(scale_factor)
 
-        color = QColor(231, 76, 60)   # 醒目红
+        color = QColor(231, 76, 60)
         marker = QGraphicsEllipseItem(
             scene_pos.x() - r, scene_pos.y() - r, 2 * r, 2 * r
         )
@@ -511,15 +645,13 @@ class SlopeGraphicsView(QGraphicsView):
                 self.scene.removeItem(self._snap_marker)
             except Exception:
                 pass
-            self._snap_marker = None    
-      
-    
+            self._snap_marker = None
+
     def _collect_snap_targets(self, ground_x, ground_y, layer_regions):
-        """收集所有吸附点和吸附线段"""
+        """收集吸附点 (顶点) 与吸附线段 (边)"""
         points = []
         segments = []
 
-        # 地表线
         for i in range(len(ground_x) - 1):
             x1, y1 = float(ground_x[i]), float(ground_y[i])
             x2, y2 = float(ground_x[i + 1]), float(ground_y[i + 1])
@@ -527,7 +659,6 @@ class SlopeGraphicsView(QGraphicsView):
             points.append((x2, y2))
             segments.append(((x1, y1), (x2, y2)))
 
-        # 土层面的顶点和边
         if layer_regions:
             for region in layer_regions:
                 pts = region.get("points", [])
@@ -538,16 +669,14 @@ class SlopeGraphicsView(QGraphicsView):
                     points.append((x1, y1))
                     segments.append(((x1, y1), (x2, y2)))
 
-        # 去重
+        # 字典去重 (O(n))
+        seen = {}
         unique = []
-        for p in points:
-            dup = False
-            for q in unique:
-                if abs(p[0] - q[0]) < 0.01 and abs(p[1] - q[1]) < 0.01:
-                    dup = True
-                    break
-            if not dup:
-                unique.append(p)
+        for (x, y) in points:
+            key = (round(x, 3), round(y, 3))
+            if key not in seen:
+                seen[key] = True
+                unique.append((x, y))
 
         self._snap_points = unique
         self._snap_segments = segments
@@ -556,7 +685,7 @@ class SlopeGraphicsView(QGraphicsView):
     # 鼠标 / 键盘事件
     # ==================================================================
     def mousePressEvent(self, event):
-        # 绘制模式下右键结束
+        # ---- 绘制模式下: 右键结束 ----
         if self._drawing_polygon and event.button() == Qt.RightButton:
             if self._drawing_mode == "polyline" and len(self._polygon_points) >= 2:
                 self._finish_polyline_drawing()
@@ -568,17 +697,24 @@ class SlopeGraphicsView(QGraphicsView):
             event.accept()
             return
 
-        # 绘制模式下左键加点
+        # ---- 绘制模式下: 左键加点 ----
         if self._drawing_polygon and event.button() == Qt.LeftButton:
             scene_pos = self.mapToScene(event.pos())
             point, _ = self._snap_to_nearest(event.pos(), scene_pos)
 
-            # 多边形: 点击起点闭合
+            # 与上一点重合 → 跳过 (处理双击时 Qt 连发两次 press)
+            if self._polygon_points:
+                last = self._polygon_points[-1]
+                if (abs(point.x() - last.x()) < 1e-4
+                        and abs(point.y() - last.y()) < 1e-4):
+                    event.accept()
+                    return
+
+            # 多边形模式下点击起点附近 = 闭合
             if self._drawing_mode == "polygon" and self._polygon_points:
                 start_screen = self.mapFromScene(self._polygon_points[0])
                 cur_screen = event.pos()
-                dist_px = (cur_screen - start_screen).manhattanLength()
-                if dist_px < 10:
+                if (cur_screen - start_screen).manhattanLength() < 10:
                     self._finish_polygon_drawing()
                     event.accept()
                     return
@@ -588,7 +724,7 @@ class SlopeGraphicsView(QGraphicsView):
             event.accept()
             return
 
-        # 平移
+        # ---- 非绘制状态: 中键/右键 = 平移 ----
         if event.button() in (Qt.MiddleButton, Qt.RightButton):
             self._is_panning = True
             self._pan_start_pos = event.pos()
@@ -596,20 +732,17 @@ class SlopeGraphicsView(QGraphicsView):
             event.accept()
         else:
             super().mousePressEvent(event)
-            
-            
+
     def mouseMoveEvent(self, event):
         if self._drawing_polygon:
             scene_pos = self.mapToScene(event.pos())
             snapped, snap_type = self._snap_to_nearest(event.pos(), scene_pos)
             self._preview_cursor = snapped
             self._update_drawing_preview(snapped)
-            # 视觉反馈
             self._update_snap_marker(snapped, snap_type)
             event.accept()
             return
-        
-        
+
     def mouseReleaseEvent(self, event):
         if event.button() in (Qt.MiddleButton, Qt.RightButton):
             self._is_panning = False
@@ -619,23 +752,7 @@ class SlopeGraphicsView(QGraphicsView):
         else:
             super().mouseReleaseEvent(event)
 
-    def mouseDoubleClickEvent(self, event):
-        if self._drawing_polygon and event.button() == Qt.LeftButton:
-            # 双击第一下 press 已经加了点, 这里要 pop
-            if self._polygon_points:
-                self._polygon_points.pop()
-            if self._drawing_mode == "polyline":
-                self._finish_polyline_drawing()
-            else:
-                self._finish_polygon_drawing()
-            event.accept()
-            return
-
-        if event.button() == Qt.MiddleButton:
-            self.fit_view_to_slope()
-            event.accept()
-        else:
-            super().mouseDoubleClickEvent(event)
+    # 说明: 不实现 mouseDoubleClickEvent —— 交互约定为"左键加点, 右键结束"
 
     def keyPressEvent(self, event):
         if self._drawing_polygon:
@@ -684,20 +801,21 @@ class SlopeGraphicsView(QGraphicsView):
     # 主渲染
     # ==================================================================
     def render_model(
-        self,
-        ground_x: list,
-        ground_y: list,
-        xc: float,
-        yc: float,
-        R: float,
-        slices: list = None,
-        water_pts: list = None,
-        layer_regions: list = None,
-        rainfall_depth: float = 0.0,
-        surcharge_loads: list = None,
-        slip_surface=None,
-        reinforcements=None,
-        materials=None,
+            self,
+            ground_x: list,
+            ground_y: list,
+            xc: float,
+            yc: float,
+            R: float,
+            slices: list = None,
+            water_pts: list = None,
+            layer_regions: list = None,
+            rainfall_depth: float = 0.0,
+            surcharge_loads: list = None,
+            slip_surface=None,
+            reinforcements=None,
+            materials=None,
+            bottom_depth: float = 6.0,
     ):
         self.scene.clear()
         self._drawing_item = None
@@ -706,12 +824,12 @@ class SlopeGraphicsView(QGraphicsView):
         if len(ground_x) < 2:
             return
 
-        min_y = min(ground_y) - 6.0
+        min_y = min(ground_y) - float(bottom_depth)
         max_y = max(ground_y) + 8.0
         min_x = ground_x[0] - 5.0
         max_x = ground_x[-1] + 5.0
 
-        # ---------- 1. 土层面 (带洞, hover / 选中高亮) ----------
+        # ---------- 1. 土层面 ----------
         self._layer_items = []
         if layer_regions:
             for r_idx, region in enumerate(layer_regions):
@@ -723,16 +841,17 @@ class SlopeGraphicsView(QGraphicsView):
                 if len(outer) < 3:
                     continue
 
-                # 构造带洞 QPainterPath, OddEvenFill 自动挖洞
                 path = QPainterPath()
                 path.setFillRule(Qt.OddEvenFill)
-                path.addPolygon(QPolygonF([QPointF(float(x), float(y)) for x, y in outer]))
+                path.addPolygon(QPolygonF(
+                    [QPointF(float(x), float(y)) for x, y in outer]
+                ))
                 path.closeSubpath()
                 for hole in holes:
                     if len(hole) >= 3:
-                        path.addPolygon(
-                            QPolygonF([QPointF(float(x), float(y)) for x, y in hole])
-                        )
+                        path.addPolygon(QPolygonF(
+                            [QPointF(float(x), float(y)) for x, y in hole]
+                        ))
                         path.closeSubpath()
 
                 mat_idx = int(region.get("material_index", 0))
@@ -740,14 +859,23 @@ class SlopeGraphicsView(QGraphicsView):
                 if materials and 0 <= mat_idx < len(materials):
                     m = materials[mat_idx]
                     mat_info = {
-                        "name": getattr(m, "name", f"材料 {mat_idx+1}"),
+                        "name": getattr(m, "name", f"材料 {mat_idx + 1}"),
                         "gamma_dry": getattr(m, "gamma_dry", "—"),
                         "gamma_sat": getattr(m, "gamma_sat", "—"),
                         "c_prime": getattr(m, "c_prime", "—"),
                         "phi_deg": getattr(m, "phi_deg", "—"),
                     }
 
-                item = LayerRegionGraphicsItem(region, path, mat_info, region_index=r_idx)
+                # ★ 每个面用自己的 hatch_scale_pct → tile_m
+                pct = int(region.get("hatch_scale_pct", 100))
+                pct = max(20, min(500, pct))
+                tile_m = 4.0 / max(0.05, pct / 100.0)
+
+                item = LayerRegionGraphicsItem(
+                    region, path, mat_info,
+                    region_index=r_idx,
+                    tile_m=tile_m,
+                )
                 self.scene.addItem(item)
                 self._layer_items.append(item)
 
@@ -823,7 +951,7 @@ class SlopeGraphicsView(QGraphicsView):
                 gy_arr = np.array(ground_y, dtype=float)
 
                 xs_samp = np.linspace(xc - R + 1e-4, xc + R - 1e-4, 1500)
-                ys_circ = yc - np.sqrt(np.maximum(0.0, R**2 - (xs_samp - xc)**2))
+                ys_circ = yc - np.sqrt(np.maximum(0.0, R ** 2 - (xs_samp - xc) ** 2))
                 ys_grnd = np.interp(xs_samp, gx_arr, gy_arr)
                 inside = np.where(ys_circ - ys_grnd < 0)[0]
 
@@ -836,7 +964,7 @@ class SlopeGraphicsView(QGraphicsView):
 
                 n_arc = 200
                 arc_xs = np.linspace(x_s, x_e, n_arc)
-                arc_ys = yc - np.sqrt(np.maximum(0.0, R**2 - (arc_xs - xc)**2))
+                arc_ys = yc - np.sqrt(np.maximum(0.0, R ** 2 - (arc_xs - xc) ** 2))
 
                 arc_path = QPainterPath()
                 arc_path.moveTo(arc_xs[0], arc_ys[0])
@@ -867,8 +995,10 @@ class SlopeGraphicsView(QGraphicsView):
             c_v = QGraphicsLineItem(xc, yc - cs, xc, yc + cs)
             c_pen = QPen(SLIP_COLOR, 2.0)
             c_pen.setCosmetic(True)
-            c_h.setPen(c_pen); c_v.setPen(c_pen)
-            self.scene.addItem(c_h); self.scene.addItem(c_v)
+            c_h.setPen(c_pen)
+            c_v.setPen(c_pen)
+            self.scene.addItem(c_h)
+            self.scene.addItem(c_v)
 
         # ---------- 7. 支护构件 ----------
         if reinforcements:
@@ -929,17 +1059,28 @@ class SlopeGraphicsView(QGraphicsView):
                     wall_item.setPen(wall_pen)
                     self.scene.addItem(wall_item)
 
-        # ---------- 8. 土条 ----------
+        # ---------- 8. 土条 (底面用真实滑面底高程) ----------
         if slices:
+            gx_arr = np.asarray(ground_x, dtype=float)
+            gy_arr = np.asarray(ground_y, dtype=float)
             for s in slices:
                 xl = s.xm - 0.5 * s.b
                 xr = s.xm + 0.5 * s.b
-                yt_l = float(np.interp(xl, ground_x, ground_y))
-                yt_r = float(np.interp(xr, ground_x, ground_y))
-                yb = s.y_base
+                yt_l = float(np.interp(xl, gx_arr, gy_arr))
+                yt_r = float(np.interp(xr, gx_arr, gy_arr))
+
+                if slip_surface is not None:
+                    try:
+                        yb_l = float(slip_surface.get_y_base(xl))
+                        yb_r = float(slip_surface.get_y_base(xr))
+                    except Exception:
+                        yb_l = yb_r = s.y_base
+                else:
+                    yb_l = yb_r = s.y_base
+
                 slice_poly = QPolygonF([
-                    QPointF(xl, yb),
-                    QPointF(xr, yb),
+                    QPointF(xl, yb_l),
+                    QPointF(xr, yb_r),
                     QPointF(xr, yt_r),
                     QPointF(xl, yt_l),
                 ])
@@ -997,8 +1138,11 @@ class SlopeGraphicsView(QGraphicsView):
             (scene_max_y - scene_min_y) * 1.05,
         )
 
+        # ---------- 12. 场景重建后重新应用选中状态 ----------
+        self._apply_region_selection()
+
     # ==================================================================
-    # 工具
+    # 静态工具
     # ==================================================================
     @staticmethod
     def _pattern_for_region(pattern):
@@ -1010,3 +1154,20 @@ class SlopeGraphicsView(QGraphicsView):
             "rock": Qt.DiagCrossPattern,
         }
         return patterns.get(pattern, Qt.SolidPattern)
+
+    def contextMenuEvent(self, event):
+        """右键 → 绘制模式下结束绘制; 非绘制模式不弹菜单
+
+        说明: Windows 平台上 QGraphicsView 的右键优先走 contextMenuEvent,
+        覆写的 mousePressEvent 里的右键分支可能根本收不到。
+        这里兜底处理, 保证右键一定能结束绘制。
+        """
+        if self._drawing_polygon:
+            if self._drawing_mode == "polyline" and len(self._polygon_points) >= 2:
+                self._finish_polyline_drawing()
+            elif self._drawing_mode == "polygon" and len(self._polygon_points) >= 3:
+                self._finish_polygon_drawing()
+            else:
+                self.cancel_polygon_drawing()
+                self.drawing_status.emit("已取消绘制")
+        event.accept()

@@ -4,22 +4,43 @@
 支持图标与文本一体化工程控件
 """
 from typing import List, Tuple, Dict, Any, Optional
+
 import numpy as np
+from PyQt5.QtCore import Qt, pyqtSignal, QSize, QTimer
+from PyQt5.QtGui import QBrush, QColor, QDoubleValidator
 from PyQt5.QtWidgets import (
     QDockWidget, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QGroupBox, QDoubleSpinBox, QSpinBox, QComboBox, QPushButton,
     QLabel, QTableWidget, QTableWidgetItem, QHeaderView, QTabWidget,
-    QProgressBar, QCheckBox, QTreeWidget, QTreeWidgetItem, QSlider,
-    QScrollArea, QFrame, QRadioButton, QCheckBox, QMessageBox
+    QProgressBar, QTreeWidget, QTreeWidgetItem, QSlider,
+    QScrollArea, QFrame, QCheckBox, QMessageBox, QStyledItemDelegate, QLineEdit, QAbstractItemView,
+    QInputDialog
 )
-from PyQt5.QtGui import QBrush, QColor
-from PyQt5.QtCore import Qt, pyqtSignal, QSize
 
-from core.slip_surface import BaseSlipSurface, CircularSlipSurface, PolygonalSlipSurface
 from core.materials import SoilMaterial
 from core.rainfall import RainfallTimeSeries
 from core.slicing import Slice
 from gui.icons import get_icon
+
+
+class NumericDelegate(QStyledItemDelegate):
+    """只允许输入浮点数的单元格编辑器"""
+
+    def createEditor(self, parent, option, index):
+        editor = QLineEdit(parent)
+        validator = QDoubleValidator(-1e9, 1e9, 6, editor)
+        validator.setNotation(QDoubleValidator.StandardNotation)
+        editor.setValidator(validator)
+        return editor
+
+    def setModelData(self, editor, model, index):
+        text = editor.text().strip()
+        try:
+            val = float(text)
+        except ValueError:
+            return  # 非法输入不写入
+        model.setData(index, f"{val:.3f}")
+
 
 class GeometryDockWidget(QDockWidget):
     """几何与地层拓扑管理停靠窗
@@ -27,44 +48,191 @@ class GeometryDockWidget(QDockWidget):
     数据模型:
       · data_ground  —— 地表轮廓线
       · data_water   —— 地下水位线
-      · data_regions —— 土层面列表; 每个面 = {points(外环), holes(内环), ...}
-
-    交互:
-      · 绘制土层面   → 画闭合多边形 → 裁剪到坡体内 → 从所有已有面减去它 → 追加为新面
-      · 绘制切割线   → 画折线 → 切分所有完全贯穿的面 → 折线不存
-      · 应用到当前面 → 把下拉框的样式/材料赋给选中的土层面
-      · 填充土层空洞 → 用第一个材料填充所有未覆盖区域
-      · 顶点联动     → 改表格里一格 → 邻近所有面的对应顶点一起移动
-      · 吸附         → 画图时自动吸附到附近顶点/边
+      · data_regions —— 土层面列表 (一组互不重叠的平面图形)
     """
     geometry_changed = pyqtSignal()
     polygon_draw_requested = pyqtSignal()
     strata_draw_requested = pyqtSignal()
     strata_validation_failed = pyqtSignal(str)
-    region_highlight_requested = pyqtSignal(int)
+    regions_highlight_requested = pyqtSignal(list)
+    view_reset_requested = pyqtSignal()
+
+    TAG_GROUND = -100
+    TAG_WATER = -101
 
     _PATTERN_COLORS = {
-        "fill":         "#e0d0a0",   # 素填土: 土黄
-        "clay":         "#e8dcc8",   # 黏土: 浅米黄
-        "silt":         "#d9d0b8",   # 粉质黏土: 浅灰黄
-        "sand":         "#f0e2a8",   # 砂土: 浅黄
-        "gravel":       "#d0c8b0",   # 砾石: 灰黄
-        "rock_strong":  "#c8c8c8",   # 强风化岩: 浅灰
-        "rock_medium":  "#b8b8b8",   # 中风化岩: 灰
-        "rock_fresh":   "#a8a8a8",   # 新鲜岩石: 深灰
-        "solid":        "#f3dfaa",   # 纯色: 默认黄
+        "fill": "#e0d0a0", "clay": "#e8dcc8", "silt": "#d9d0b8",
+        "sand": "#f0e2a8", "gravel": "#d0c8b0",
+        "rock_strong": "#c8c8c8", "rock_medium": "#b8b8b8",
+        "rock_fresh": "#a8a8a8", "solid": "#f3dfaa",
     }
-    
-    
-    _DEFAULT_BOTTOM_DEPTH = 6.0
+
     _ICON_SIZE = 20
     _BTN_SIZE = 32
+    _REFRESH_DEBOUNCE_MS = 150
+    _ADJACENCY_TOL = 0.05
+    _ADJACENCY_DIST_TOL = 1e-3
+    _MERGE_CLOSE_DELTA = 0.005
+
+    _VERTEX_SYNC_TOL = 1e-6
+    _REPLACE_OVERLAP_RATIO = 0.98
+    _SLIVER_MIN_AREA = 0.05
+    _SLIVER_MIN_EQ_WIDTH = 0.10
+    _CUT_EXTEND = 5.0
+    _SIMPLIFY_TOL = 0.01
 
     def __init__(self, parent=None):
         super().__init__("模型几何与地层分界", parent)
         self.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         self._suspend_table_signal = False
+        self._ground_dirty = False
+        self._syncing_selection = False
+        self._bottom_depth = 6.0            # ★ 新增
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.setInterval(self._REFRESH_DEBOUNCE_MS)
+        self._refresh_timer.timeout.connect(self._do_refresh)
+
         self._init_ui()
+
+    # ==================================================================
+    # 防抖
+    # ==================================================================
+    def _schedule_refresh(self):
+        self._refresh_timer.start()
+
+    def _emit_now(self):
+        self._refresh_timer.stop()
+        self.geometry_changed.emit()
+
+    def _do_refresh(self):
+        if self._ground_dirty:
+            self._clip_regions_to_boundary()
+            self._clip_water_to_ground()
+            self._ground_dirty = False
+        self.geometry_changed.emit()
+
+    # ==================================================================
+    # 建模深度
+    # ==================================================================
+    def get_bottom_depth(self) -> float:
+        return float(self._bottom_depth)
+
+    def _on_bottom_depth_changed(self, value: float):
+        """深度变化 → 坡体边界伸缩 → 土层块跟随(仅裁剪, 不扩展)
+
+        · 变浅: 土层块超出新边界 → clip 裁掉
+        · 变深: 土层块在边界内 → clip 内部自动跳过, 土层块不动
+        顺序: 先改边界(由 _bottom_depth 隐式生效), 再裁土层块。
+        """
+        self._bottom_depth = float(value)
+        self._clip_regions_to_boundary()
+        self._clip_water_to_ground()
+        self._ground_dirty = False
+        self.geometry_changed.emit()
+        self.view_reset_requested.emit()
+
+
+    # ==================================================================
+    # 细长碎片判定
+    # ==================================================================
+    @classmethod
+    def _is_sliver(cls, poly) -> bool:
+        if poly is None or poly.is_empty:
+            return True
+        try:
+            area = float(poly.area)
+        except Exception:
+            return True
+        if area < cls._SLIVER_MIN_AREA:
+            return True
+        try:
+            perim = float(poly.length)
+        except Exception:
+            return True
+        if perim < 1e-9:
+            return True
+        return 4.0 * area / perim < cls._SLIVER_MIN_EQ_WIDTH
+
+    # ==================================================================
+    # 视图重置
+    # ==================================================================
+    def _reset_to_ground_view(self):
+        self.tree.blockSignals(True)
+        try:
+            self.current_editing_key = "ground"
+            self.tree.setCurrentItem(self.item_ground)
+        finally:
+            self.tree.blockSignals(False)
+
+        self.lbl_table_title.setText("<b>地表轮廓线控制点 (X, Y 单位: 米):</b>")
+        self._load_table_data(self.data_ground)
+        self.combo_region_pattern.setEnabled(False)
+        self.combo_region_material.setEnabled(False)
+        self.slider_hatch_scale.setEnabled(False)
+        self.lbl_hatch_scale_value.setEnabled(False)
+        self.regions_highlight_requested.emit([])
+
+    # ==================================================================
+    # 地表线改动 → 裁剪土层
+    # ==================================================================
+    def _clip_regions_to_boundary(self):
+        boundary = self._build_slope_boundary_polygon()
+        if boundary is None or boundary.is_empty:
+            return
+
+        new_regions = []
+        changed = False
+
+        for r in self.data_regions:
+            p = self._to_shapely_polygon(r.get("points", []), r.get("holes", []))
+            if p is None or p.is_empty:
+                new_regions.append(r)
+                continue
+
+            try:
+                outside = p.difference(boundary)
+                if outside.is_empty or outside.area < 1e-6:
+                    new_regions.append(r)
+                    continue
+            except Exception:
+                new_regions.append(r)
+                continue
+
+            try:
+                clipped = p.intersection(boundary)
+            except Exception:
+                new_regions.append(r)
+                continue
+
+            if clipped.is_empty or clipped.area < 0.01:
+                changed = True
+                continue
+
+            pieces = self._extract_polygons(clipped)
+            pieces = [pc for pc in pieces if not self._is_sliver(pc)]
+            if not pieces:
+                changed = True
+                continue
+
+            if len(pieces) == 1:
+                new_regions.append(self._polygon_to_region_dict(pieces[0], r))
+            else:
+                base_name = r.get("name", "土层面")
+                for k, piece in enumerate(pieces):
+                    new_region = self._polygon_to_region_dict(piece, r)
+                    new_region["name"] = f"{base_name}-{k + 1}"
+                    new_regions.append(new_region)
+
+            changed = True
+
+        if changed:
+            for i, r in enumerate(new_regions):
+                r["id"] = i + 1
+            self.data_regions = new_regions
+            self._refresh_region_tree(keep_selection=False)
+            if self.current_editing_key.startswith("region_"):
+                self._reset_to_ground_view()
 
     # ==================================================================
     # UI 构建
@@ -75,55 +243,58 @@ class GeometryDockWidget(QDockWidget):
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
 
-        # ---------------- 图层树 + 工具条 ----------------
         lbl_tree = QLabel("几何实体与地层图层树")
         lbl_tree.setStyleSheet("font-weight: bold; padding: 2px;")
         layout.addWidget(lbl_tree)
 
-        # 紧凑工具条
         h_toolbar = QHBoxLayout()
         h_toolbar.setSpacing(4)
         h_toolbar.setContentsMargins(0, 0, 0, 0)
 
         btn_draw_region = self._make_icon_button(
             "draw_polygon",
-            "绘制土层面\n\n点击后在地图上画闭合多边形，\n超出坡体的部分会自动裁掉。",
+            "绘制土层面\n\n画闭合多边形; 与已有面重叠的部分\n会从已有面中减去 (旧面消失)。",
             self.polygon_draw_requested.emit,
         )
         btn_draw_cut = self._make_icon_button(
             "draw_cut",
-            "绘制切割线\n\n画一条折线，软件自动切分\n所有被它完全贯穿的土层面。",
+            "绘制切割线\n\n画折线; 所有被线完全贯穿的土层面\n会被切成两块, 未完全贯穿的保持原样。",
             self.strata_draw_requested.emit,
         )
         btn_fill_holes = self._make_icon_button(
             "fill_hole",
-            "填充土层空洞\n\n用第一个材料填充所有\n未覆盖的坡体内部区域。",
+            "填充土层空洞\n\n找出坡体内未被任何土层面覆盖的区域,\n用相邻层的材料填上并合并。",
             self.fill_holes,
         )
+        btn_merge = self._make_icon_button(
+            "merge_layers",
+            "合并土层\n\nCtrl 多选 ≥2 个边挨边的土层面,\n合并为一个, 继承指定主面的属性。",
+            self.merge_selected_regions,
+        )
         btn_del_entity = self._make_icon_button(
-            "del_item",
-            "删除当前实体\n\n删除图层树里选中的土层面。",
-            self._del_current_entity,
+            "del_item", "删除选中的土层面", self._del_current_entity,
         )
 
-        h_toolbar.addWidget(btn_draw_region)
-        h_toolbar.addWidget(btn_draw_cut)
-        h_toolbar.addWidget(btn_fill_holes)
-        h_toolbar.addWidget(btn_del_entity)
+        for b in (btn_draw_region, btn_draw_cut, btn_fill_holes, btn_merge, btn_del_entity):
+            h_toolbar.addWidget(b)
         h_toolbar.addStretch()
         layout.addLayout(h_toolbar)
 
-        # 图层树
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["图层实体名称", "控制点数", "土层类型"])
         self.tree.setColumnWidth(0, 150)
         self.tree.setColumnWidth(1, 60)
         self.tree.setColumnWidth(2, 80)
         self.tree.setSelectionBehavior(QTreeWidget.SelectRows)
+        self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
 
         self.item_ground = QTreeWidgetItem(["地表轮廓线", "4", ""])
         self.item_water = QTreeWidgetItem(["地下水浸润线", "4", ""])
-        self.item_regions_root = QTreeWidgetItem(["土层面 (闭合区域)", "0", ""])
+        self.item_regions_root = QTreeWidgetItem(["土层面", "0", ""])
+
+        for it in (self.item_ground, self.item_water, self.item_regions_root):
+            it.setTextAlignment(1, Qt.AlignCenter)
+            it.setTextAlignment(2, Qt.AlignCenter)
 
         self.tree.addTopLevelItem(self.item_ground)
         self.tree.addTopLevelItem(self.item_water)
@@ -131,7 +302,34 @@ class GeometryDockWidget(QDockWidget):
         self.item_regions_root.setExpanded(True)
 
         self.tree.currentItemChanged.connect(self._on_tree_selection_changed)
+        self.tree.itemSelectionChanged.connect(self._on_tree_multi_selection_changed)
         layout.addWidget(self.tree, stretch=3)
+
+        # ---------------- ★ 建模范围 ----------------
+        grp_depth = QGroupBox("建模范围")
+        f_depth = QFormLayout(grp_depth)
+        f_depth.setContentsMargins(6, 6, 6, 6)
+        f_depth.setSpacing(4)
+
+        self.spin_bottom_depth = QDoubleSpinBox()
+        self.spin_bottom_depth.setRange(0.5, 300.0)
+        self.spin_bottom_depth.setValue(6.0)
+        self.spin_bottom_depth.setSingleStep(1.0)
+        self.spin_bottom_depth.setDecimals(2)
+        self.spin_bottom_depth.setSuffix(" m")
+        self.spin_bottom_depth.setToolTip(
+            "坡体底边 = 地表最低点 − 该值。\n"
+            "影响: 坡体边界、默认土层大面、画布 Y 轴下界。\n"
+            "调整后可能需要点击「填充」按钮补全底部区域。"
+        )
+        self.spin_bottom_depth.valueChanged.connect(self._on_bottom_depth_changed)
+        f_depth.addRow("地表以下深度:", self.spin_bottom_depth)
+
+        lbl_hint = QLabel("<i>坡体底边 = 地表最低点 − 该值</i>")
+        lbl_hint.setStyleSheet("color: #7f8c8d; font-size: 11px;")
+        f_depth.addRow(lbl_hint)
+
+        layout.addWidget(grp_depth)
 
         # ---------------- 吸附与容差 ----------------
         grp_snap = QGroupBox("吸附与容差")
@@ -144,7 +342,6 @@ class GeometryDockWidget(QDockWidget):
         self.spin_snap_tol.setValue(0.5)
         self.spin_snap_tol.setSingleStep(0.1)
         self.spin_snap_tol.setSuffix(" m")
-        self.spin_snap_tol.setToolTip("顶点联动 / 吸附的最大距离")
         self.spin_snap_tol.valueChanged.connect(self._on_snap_settings_changed)
         f_snap.addRow("容差:", self.spin_snap_tol)
 
@@ -178,36 +375,31 @@ class GeometryDockWidget(QDockWidget):
         self.combo_region_pattern.addItem("中风化岩 — 斜线", "rock_medium")
         self.combo_region_pattern.addItem("新鲜岩石 — 三角符号", "rock_fresh")
         self.combo_region_pattern.addItem("纯色填充", "solid")
-        self.combo_region_pattern.setToolTip("填充纹理 (按 YS/T 5204 岩土工程制图规范)")
 
         self.combo_region_material = QComboBox()
         self.combo_region_material.addItems(["材料 1"])
-        self.combo_region_material.setToolTip("材料")
 
         h_pickers.addWidget(self.combo_region_pattern, 1)
         h_pickers.addWidget(self.combo_region_material, 1)
         v_face.addLayout(h_pickers)
 
-        # btn_apply_mat = QPushButton("  应用到当前面")
-        # btn_apply_mat.setIcon(get_icon("apply_face"))
-        # btn_apply_mat.setIconSize(QSize(self._ICON_SIZE, self._ICON_SIZE))
-        # btn_apply_mat.setToolTip("把上面选中的样式和材料赋给图层树里选中的土层面")
-        # btn_apply_mat.setStyleSheet(
-        #     "QPushButton{background-color:#8e44ad;color:white;"
-        #     "font-weight:bold;padding:5px;border-radius:3px;}"
-        #     "QPushButton:hover{background-color:#9b59b6;}"
-        # )
-        # btn_apply_mat.clicked.connect(self._apply_material_to_current_region)
-        # v_face.addWidget(btn_apply_mat)
-                # ★ 下拉框一改, 立即应用到当前选中的面
+        h_scale = QHBoxLayout()
+        h_scale.setSpacing(6)
+        h_scale.addWidget(QLabel("填充比例:"))
+        self.slider_hatch_scale = QSlider(Qt.Horizontal)
+        self.slider_hatch_scale.setRange(30, 400)
+        self.slider_hatch_scale.setValue(100)
+        self.slider_hatch_scale.valueChanged.connect(self._on_hatch_scale_changed)
+        h_scale.addWidget(self.slider_hatch_scale, 1)
+        self.lbl_hatch_scale_value = QLabel("100%")
+        self.lbl_hatch_scale_value.setFixedWidth(48)
+        h_scale.addWidget(self.lbl_hatch_scale_value)
+        v_face.addLayout(h_scale)
+
         self.combo_region_pattern.setEnabled(False)
         self.combo_region_material.setEnabled(False)
-        self.combo_region_pattern.currentIndexChanged.connect(
-            self._on_style_changed
-        )
-        self.combo_region_material.currentIndexChanged.connect(
-            self._on_material_changed
-        )
+        self.combo_region_pattern.currentIndexChanged.connect(self._on_style_changed)
+        self.combo_region_material.currentIndexChanged.connect(self._on_material_changed)
 
         layout.addWidget(grp_face)
 
@@ -215,49 +407,40 @@ class GeometryDockWidget(QDockWidget):
         self.lbl_table_title = QLabel("<b>地表轮廓线控制点 (X, Y 单位: 米):</b>")
         layout.addWidget(self.lbl_table_title)
 
+        h_table_tools = QHBoxLayout()
+        h_table_tools.setSpacing(4)
+        btn_add_pt = self._make_icon_button("add_item", "添加坐标点", self._add_point)
+        btn_del_pt = self._make_icon_button("del_item", "删除选中点", self._del_point)
+        h_table_tools.addWidget(btn_add_pt)
+        h_table_tools.addWidget(btn_del_pt)
+        h_table_tools.addStretch()
+        layout.addLayout(h_table_tools)
+
         self.tbl_coords = QTableWidget(4, 2)
         self.tbl_coords.setHorizontalHeaderLabels(["X 坐标 (m)", "Y 高程 (m)"])
         self.tbl_coords.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.tbl_coords.itemChanged.connect(self._on_table_cell_changed)
+        self._numeric_delegate = NumericDelegate(self.tbl_coords)
+        self.tbl_coords.setItemDelegate(self._numeric_delegate)
         layout.addWidget(self.tbl_coords, stretch=3)
 
-        # 表格下方图标工具条
-        h_table_tools = QHBoxLayout()
-        h_table_tools.setSpacing(4)
-
-        btn_add_pt = self._make_icon_button(
-            "add_item", "添加坐标点", self._add_point
-        )
-        btn_del_pt = self._make_icon_button(
-            "del_item", "删除选中点", self._del_point
-        )
-        btn_refresh = self._make_icon_button(
-            "refresh", "刷新几何模型", self._save_current_table_and_notify
-        )
-        h_table_tools.addWidget(btn_add_pt)
-        h_table_tools.addWidget(btn_del_pt)
-        h_table_tools.addWidget(btn_refresh)
-        h_table_tools.addStretch()
-        layout.addLayout(h_table_tools)
-
-        # ---------- 内容加滚动条 ----------
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setWidget(container)
         self.setWidget(scroll)
 
-        # ---------- 默认数据 ----------
+        # ---------------- 默认数据 ----------------
         self.data_ground = [(0.0, 15.0), (20.0, 15.0), (35.0, 0.0), (60.0, 0.0)]
-        self.data_water = [(0.0, 12.0), (20.0, 12.0), (35.0, -1.0), (60.0, -1.0)]
+        self.data_water = []
         self.data_regions = [self._build_default_region()]
         self.current_editing_key = "ground"
 
         self._refresh_region_tree()
+        self._clip_water_to_ground()
         self._load_table_data(self.data_ground)
 
     def _make_icon_button(self, icon_name, tooltip, slot):
-        """生成一个 32x32 的纯图标按钮, tooltip 里放说明文字"""
         btn = QPushButton()
         btn.setIcon(get_icon(icon_name))
         btn.setIconSize(QSize(self._ICON_SIZE, self._ICON_SIZE))
@@ -273,20 +456,19 @@ class GeometryDockWidget(QDockWidget):
         return btn
 
     # ==================================================================
-    # 坡体边界多边形
+    # 坡体边界 / 默认面
     # ==================================================================
     def _build_slope_boundary_polygon(self):
         try:
             from shapely.geometry import Polygon
         except ImportError:
             return None
-
         if len(self.data_ground) < 2:
             return None
 
         gx = [p[0] for p in self.data_ground]
         gy = [p[1] for p in self.data_ground]
-        bottom = min(gy) - self._DEFAULT_BOTTOM_DEPTH
+        bottom = min(gy) - self._bottom_depth       # ★ 用实例属性
         x_left, x_right = gx[0], gx[-1]
 
         points = [(x_left, bottom)]
@@ -301,7 +483,7 @@ class GeometryDockWidget(QDockWidget):
     def _build_default_region(self):
         gx = [p[0] for p in self.data_ground]
         gy = [p[1] for p in self.data_ground]
-        bottom = min(gy) - self._DEFAULT_BOTTOM_DEPTH
+        bottom = min(gy) - self._bottom_depth       # ★ 用实例属性
         x_left, x_right = gx[0], gx[-1]
 
         points = [(x_left, bottom)]
@@ -310,64 +492,119 @@ class GeometryDockWidget(QDockWidget):
         points.append((x_right, bottom))
 
         return {
-            "id": 1,
-            "name": "土层面 1",
-            "points": points,
-            "holes": [],
+            "id": 1, "name": "土层面 1", "points": points, "holes": [],
             "material_index": 0,
             "color": self._PATTERN_COLORS["solid"],
             "pattern": "solid",
+            "hatch_scale_pct": 100,
         }
 
     # ==================================================================
-    # 图层树选择 → 高亮
+    # 图层树选择
     # ==================================================================
+    def _on_tree_multi_selection_changed(self):
+        if self._syncing_selection:
+            return
+
+        selected = [it for it in self.tree.selectedItems()
+                    if it.parent() is self.item_regions_root]
+        if not selected:
+            self.regions_highlight_requested.emit([])
+            return
+        indices = sorted(self.item_regions_root.indexOfChild(it)
+                         for it in selected)
+        self.regions_highlight_requested.emit(indices)
+
+    def set_selected_regions(self, indices):
+        """由画布调用: 同步选中状态到图层树"""
+        self._syncing_selection = True
+        try:
+            idx_set = set(int(i) for i in (indices or []) if int(i) >= 0)
+            self.item_ground.setSelected(False)
+            self.item_water.setSelected(False)
+            for i in range(self.item_regions_root.childCount()):
+                child = self.item_regions_root.child(i)
+                child.setSelected(i in idx_set)
+        finally:
+            self._syncing_selection = False
+
     def _on_tree_selection_changed(self, current, previous):
         if not current:
             return
-        self._save_current_table_data()
-        self.region_highlight_requested.emit(-1)
+
+        if self._is_editing_key_consistent(previous):
+            self._save_current_table_data()
 
         if current is self.item_ground:
             self.current_editing_key = "ground"
             self.lbl_table_title.setText("<b>地表轮廓线控制点 (X, Y 单位: 米):</b>")
             self._load_table_data(self.data_ground)
+            self.combo_region_pattern.setEnabled(False)
+            self.combo_region_material.setEnabled(False)
+            self.slider_hatch_scale.setEnabled(False)
+            self.lbl_hatch_scale_value.setEnabled(False)
+
         elif current is self.item_water:
             self.current_editing_key = "water"
             self.lbl_table_title.setText("<b>地下水浸润线控制点 (X, Y 单位: 米):</b>")
             self._load_table_data(self.data_water)
             self.combo_region_pattern.setEnabled(False)
             self.combo_region_material.setEnabled(False)
+            self.slider_hatch_scale.setEnabled(False)
+            self.lbl_hatch_scale_value.setEnabled(False)
+
+
         elif current.parent() is self.item_regions_root:
             idx = self.item_regions_root.indexOfChild(current)
             self.current_editing_key = f"region_{idx}"
             if 0 <= idx < len(self.data_regions):
                 region = self.data_regions[idx]
-                self.lbl_table_title.setText(
-                    f"<b>{region['name']} 外环顶点 (闭合多边形):</b>"
-                )
+                self.lbl_table_title.setText(f"<b>{region['name']} 外环顶点:</b>")
                 self._load_table_data(region.get("points", []))
-                self.region_highlight_requested.emit(idx)
-
-                # ★ 启用下拉框 + 同步显示当前面的样式/材料
                 self.combo_region_pattern.setEnabled(True)
                 self.combo_region_material.setEnabled(True)
-
+                self.slider_hatch_scale.setEnabled(True)
+                self.lbl_hatch_scale_value.setEnabled(True)
                 self.combo_region_pattern.blockSignals(True)
                 self.combo_region_material.blockSignals(True)
-
+                self.slider_hatch_scale.blockSignals(True)
                 pat = region.get("pattern", "solid")
                 for i in range(self.combo_region_pattern.count()):
                     if self.combo_region_pattern.itemData(i) == pat:
                         self.combo_region_pattern.setCurrentIndex(i)
                         break
-
                 mat_idx = int(region.get("material_index", 0))
                 if 0 <= mat_idx < self.combo_region_material.count():
                     self.combo_region_material.setCurrentIndex(mat_idx)
-
+                pct = int(region.get("hatch_scale_pct", 100))
+                pct = max(self.slider_hatch_scale.minimum(),
+                          min(self.slider_hatch_scale.maximum(), pct))
+                self.slider_hatch_scale.setValue(pct)
+                self.lbl_hatch_scale_value.setText(f"{pct}%")
                 self.combo_region_pattern.blockSignals(False)
                 self.combo_region_material.blockSignals(False)
+                self.slider_hatch_scale.blockSignals(False)
+
+
+
+    def _is_editing_key_consistent(self, item) -> bool:
+        if item is None:
+            return True
+        key = self.current_editing_key
+        if key == "ground":
+            return item is self.item_ground
+        if key == "water":
+            return item is self.item_water
+        if key.startswith("region_"):
+            if item.parent() is not self.item_regions_root:
+                return False
+            idx = self.item_regions_root.indexOfChild(item)
+            try:
+                key_idx = int(key.split("_")[1])
+            except (ValueError, IndexError):
+                return False
+            return (idx == key_idx) and (0 <= key_idx < len(self.data_regions))
+        return False
 
     # ==================================================================
     # 表格 <-> 数据
@@ -397,12 +634,17 @@ class GeometryDockWidget(QDockWidget):
                 self.data_water = pts
                 self.item_water.setText(1, str(len(pts)))
         elif self.current_editing_key.startswith("region_"):
-            idx = int(self.current_editing_key.split("_")[1])
+            try:
+                idx = int(self.current_editing_key.split("_")[1])
+            except (ValueError, IndexError):
+                return
             if 0 <= idx < len(self.data_regions):
                 if len(pts) >= 3:
                     self.data_regions[idx]["points"] = pts
 
     def _load_table_data(self, pts):
+        if pts is None:
+            pts = []
         self._suspend_table_signal = True
         try:
             self.tbl_coords.setRowCount(len(pts))
@@ -417,27 +659,44 @@ class GeometryDockWidget(QDockWidget):
         self.tbl_coords.insertRow(row)
         self.tbl_coords.setItem(row, 0, QTableWidgetItem("0.0"))
         self.tbl_coords.setItem(row, 1, QTableWidgetItem("0.0"))
+        self._save_current_table_data()
+        if self.current_editing_key == "ground":
+            self._ground_dirty = True
+        self._schedule_refresh()
 
     def _del_point(self):
         r = self.tbl_coords.currentRow()
         min_rows = 3 if self.current_editing_key.startswith("region_") else 2
         if r >= 0 and self.tbl_coords.rowCount() > min_rows:
             self.tbl_coords.removeRow(r)
+            self._save_current_table_data()
+            if self.current_editing_key == "ground":
+                self._ground_dirty = True
+            self._schedule_refresh()
 
-    def _save_current_table_and_notify(self):
-        self._save_current_table_data()
-        self.geometry_changed.emit()
-
-    # ==================================================================
-    # 顶点联动
-    # ==================================================================
     def _on_table_cell_changed(self, item):
         if self._suspend_table_signal:
             return
+
+        if self.current_editing_key == "ground":
+            self._save_current_table_data()
+            self._ground_dirty = True
+            self._schedule_refresh()
+            return
+        if self.current_editing_key == "water":
+            self._save_current_table_data()
+            self._clip_water_to_ground()  # ★ 加这行
+            self._load_table_data(self.data_water)  # 刷新表格显示新值
+            self._schedule_refresh()
+            return
+
         if not self.current_editing_key.startswith("region_"):
             return
 
-        idx = int(self.current_editing_key.split("_")[1])
+        try:
+            idx = int(self.current_editing_key.split("_")[1])
+        except (ValueError, IndexError):
+            return
         if not (0 <= idx < len(self.data_regions)):
             return
 
@@ -458,18 +717,158 @@ class GeometryDockWidget(QDockWidget):
         if abs(new_x - old_x) < 1e-9 and abs(new_y - old_y) < 1e-9:
             return
 
-        tol = self.get_snap_tolerance()
-
+        TOL = self._VERTEX_SYNC_TOL
         for r in self.data_regions:
             r_pts = r.get("points", [])
             r["points"] = [
-                (new_x, new_y) if (abs(px - old_x) < tol and abs(py - old_y) < tol)
+                (new_x, new_y) if (abs(px - old_x) < TOL and abs(py - old_y) < TOL)
                 else (px, py)
                 for (px, py) in r_pts
             ]
+        self._clip_water_to_ground()
 
+        self._refresh_region_tree(keep_selection=True)
+        self._schedule_refresh()
+
+    def _on_hatch_scale_changed(self, value: int):
+        self.lbl_hatch_scale_value.setText(f"{value}%")
+        idx = self._get_current_region_index()
+        if idx < 0:
+            return
+        self.data_regions[idx]["hatch_scale_pct"] = int(value)
+        self._emit_now()
+
+    def _clip_water_to_ground(self):
+        """水位线必须在坡体边界内部 (地表以下, 坡底以上)
+
+        规则:
+          1. 初始 (空水位) → 沿地表每个折点下移 _bottom_depth (与地表同形)
+          2. x 范围不足 → 两端补默认点
+          3. 密集采样 + clamp 到 [坡底, 地表] → 保证不穿出边界
+          4. 去共线点保持简洁
+        """
+        if len(self.data_ground) < 2:
+            self.data_water = []
+            self.item_water.setText(1, "0")
+            return
+
+        gx = [p[0] for p in self.data_ground]
+        gy = [p[1] for p in self.data_ground]
+        gx_min, gx_max = min(gx), max(gx)
+        gx_arr = np.array(gx, dtype=float)
+        gy_arr = np.array(gy, dtype=float)
+
+        def _ground_y(x):
+            return float(np.interp(x, gx_arr, gy_arr))
+
+        def _bottom_y(x):
+            return _ground_y(x) - self._bottom_depth
+
+        def _default_water():
+            # ★ 与地表同形: 每个地表折点下移 _bottom_depth
+            return [(gx[i], gy[i] - self._bottom_depth) for i in range(len(gx))]
+
+        # ---- 空水位 → 默认 ----
+        if not self.data_water:
+            self.data_water = _default_water()
+            self.item_water.setText(1, str(len(self.data_water)))
+            return
+
+        # ---- 排序 + 裁 x 超出地表范围的点 ----
+        water = sorted(self.data_water, key=lambda p: p[0])
+        water = [(x, y) for (x, y) in water
+                 if gx_min - 1e-6 <= x <= gx_max + 1e-6]
+
+        if not water:
+            self.data_water = _default_water()
+            self.item_water.setText(1, str(len(self.data_water)))
+            return
+
+        # ---- 左右端补默认点 ----
+        if water[0][0] > gx_min + 1e-6:
+            water.insert(0, (gx_min, _ground_y(gx_min) - self._bottom_depth))
+        if water[-1][0] < gx_max - 1e-6:
+            water.append((gx_max, _ground_y(gx_max) - self._bottom_depth))
+
+        # ---- ★ 密集采样 + clamp 到 [坡底, 地表] ----
+        wx_arr = np.array([p[0] for p in water], dtype=float)
+        wy_arr = np.array([p[1] for p in water], dtype=float)
+        n_samples = max(80, int((gx_max - gx_min) * 4))
+        xs = np.linspace(gx_min, gx_max, n_samples)
+
+        sampled = []
+        for x in xs:
+            y_w = float(np.interp(x, wx_arr, wy_arr))
+            y_g = _ground_y(x)
+            y_b = y_g - self._bottom_depth
+            y = min(y_w, y_g)  # 不高于地表 (相切允许)
+            y = max(y, y_b)  # 不低于坡底 (相切允许)
+            sampled.append((float(x), float(y)))
+
+        # ---- 去共线点 ----
+        water_clean = self._remove_collinear(sampled, tol=1e-3)
+
+        if len(water_clean) < 2:
+            water_clean = _default_water()
+
+        self.data_water = water_clean
+        self.item_water.setText(1, str(len(self.data_water)))
+
+    @staticmethod
+    def _remove_collinear(points, tol=1e-3):
+        """去除共线冗余点 (只在真正拐弯处保留顶点)"""
+        if len(points) < 3:
+            return list(points)
+        result = [points[0]]
+        for i in range(1, len(points) - 1):
+            p0 = result[-1]
+            p1 = points[i]
+            p2 = points[i + 1]
+            dx = p2[0] - p0[0]
+            dy = p2[1] - p0[1]
+            L = (dx * dx + dy * dy) ** 0.5
+            if L < 1e-9:
+                continue
+            dist = abs((p1[0] - p0[0]) * dy - (p1[1] - p0[1]) * dx) / L
+            if dist > tol:
+                result.append(p1)
+        result.append(points[-1])
+        return result
+
+    # ==================================================================
+    # 样式 / 材料
+    # ==================================================================
+    def _get_current_region_index(self):
+        curr = self.tree.currentItem()
+        if curr is None or curr.parent() is not self.item_regions_root:
+            return -1
+        idx = self.item_regions_root.indexOfChild(curr)
+        if 0 <= idx < len(self.data_regions):
+            return idx
+        return -1
+
+    def _on_style_changed(self, _=None):
+        idx = self._get_current_region_index()
+        if idx < 0:
+            return
+        pattern = self.combo_region_pattern.currentData() or "solid"
+        color = self._PATTERN_COLORS.get(pattern, "#f3dfaa")
+        mat_idx = self.combo_region_material.currentIndex()
+        if mat_idx < 0:
+            mat_idx = 0
+        pct = int(self.slider_hatch_scale.value())
+        self.data_regions[idx]["pattern"] = pattern
+        self.data_regions[idx]["color"] = color
         self._refresh_region_tree()
-        self.geometry_changed.emit()
+        self._emit_now()
+
+    def _on_material_changed(self, _=None):
+        idx = self._get_current_region_index()
+        if idx < 0:
+            return
+        self.data_regions[idx]["material_index"] = self.combo_region_material.currentIndex()
+        self._refresh_region_tree()
+        self._emit_now()
 
     # ==================================================================
     # 吸附设置
@@ -480,8 +879,11 @@ class GeometryDockWidget(QDockWidget):
     def get_snap_mode(self) -> str:
         return self.combo_snap_mode.currentData() or "none"
 
+    # def get_hatch_scale(self) -> float:
+    #     return self.slider_hatch_scale.value() / 100.0
+
     def _on_snap_settings_changed(self, *_):
-        self.geometry_changed.emit()
+        self._emit_now()
 
     # ==================================================================
     # shapely 工具
@@ -509,10 +911,8 @@ class GeometryDockWidget(QDockWidget):
             shell = [(float(x), float(y)) for x, y in points]
             rings = None
             if holes:
-                rings = [
-                    [(float(x), float(y)) for x, y in h]
-                    for h in holes if len(h) >= 3
-                ] or None
+                rings = [[(float(x), float(y)) for x, y in h]
+                         for h in holes if len(h) >= 3] or None
             p = Polygon(shell=shell, holes=rings)
             if not p.is_valid:
                 p = p.buffer(0)
@@ -520,8 +920,120 @@ class GeometryDockWidget(QDockWidget):
         except Exception:
             return None
 
+    @staticmethod
+    def _close_geometry(geom, delta: float):
+        if geom is None or geom.is_empty:
+            return geom
+        try:
+            grown = geom.buffer(delta, join_style=1, cap_style=1)
+            shrunk = grown.buffer(-delta, join_style=1, cap_style=1)
+            if shrunk.is_empty or not shrunk.is_valid:
+                return geom
+            return shrunk
+        except Exception:
+            return geom
+
+    def _is_adjacent(self, pa, pb) -> bool:
+        TOL = self._ADJACENCY_DIST_TOL
+        try:
+            if pa.distance(pb) > TOL:
+                return False
+        except Exception:
+            return False
+        try:
+            a_bound_buf = pa.boundary.buffer(TOL)
+            inter = a_bound_buf.intersection(pb.boundary)
+        except Exception:
+            return False
+        if inter.is_empty:
+            return False
+        if inter.geom_type in ("LineString", "MultiLineString"):
+            return inter.length > TOL
+        return False
+
+    def _contact_length(self, pa, pb) -> float:
+        TOL = self._ADJACENCY_DIST_TOL
+        try:
+            if pa.distance(pb) > TOL:
+                return 0.0
+        except Exception:
+            return 0.0
+        try:
+            a_bound_buf = pa.boundary.buffer(TOL)
+            inter = a_bound_buf.intersection(pb.boundary)
+        except Exception:
+            return 0.0
+        if inter.is_empty:
+            return 0.0
+        if inter.geom_type in ("LineString", "MultiLineString"):
+            return float(inter.length)
+        return 0.0
+
+    @staticmethod
+    def _dedup_coords(coords, tol: float = 1e-4):
+        if not coords:
+            return []
+        out = [coords[0]]
+        for p in coords[1:]:
+            px, py = float(p[0]), float(p[1])
+            lx, ly = out[-1]
+            if abs(px - lx) > tol or abs(py - ly) > tol:
+                out.append((px, py))
+        if len(out) >= 2:
+            lx, ly = out[-1]
+            fx, fy = out[0]
+            if abs(lx - fx) < tol and abs(ly - fy) < tol:
+                out.pop()
+        return out
+
+    def _polygon_to_region_dict(self, poly, template):
+        """从 shapely Polygon 生成 region dict, 属性继承 template"""
+        new_region = dict(template)
+
+        # 几何简化: 消除 buffer / union 产生的冗余点
+        try:
+            simplified = poly.simplify(self._SIMPLIFY_TOL, preserve_topology=True)
+            if (not simplified.is_empty
+                    and simplified.is_valid
+                    and simplified.geom_type == "Polygon"):
+                poly = simplified
+        except Exception:
+            pass
+
+        ext_coords = list(poly.exterior.coords)[:-1]
+        new_region["points"] = GeometryDockWidget._dedup_coords(ext_coords)
+
+        holes = []
+        for inner in poly.interiors:
+            h_coords = list(inner.coords)[:-1]
+            h_dedup = GeometryDockWidget._dedup_coords(h_coords)
+            if len(h_dedup) >= 3:
+                holes.append(h_dedup)
+        new_region["holes"] = holes
+
+        return new_region
+
+    @staticmethod
+    def _extend_polyline_ends(pts, extend: float):
+        if len(pts) < 2 or extend <= 0:
+            return list(pts)
+
+        import math
+        p0, p1 = pts[0], pts[1]
+        pn, pnm1 = pts[-1], pts[-2]
+
+        def _ext(p, q, d):
+            dx = p[0] - q[0]
+            dy = p[1] - q[1]
+            L = math.hypot(dx, dy)
+            if L < 1e-9:
+                return p
+            return (p[0] + dx / L * d, p[1] + dy / L * d)
+
+        return [_ext(p0, p1, extend)] + list(pts[1:-1]) + [_ext(pn, pnm1, extend)]
+
     # ==================================================================
-    # 添加新面 (挖洞逻辑)
+    # 添加新面
     # ==================================================================
     def add_region(self, points):
         if len(points) < 3:
@@ -534,14 +1046,12 @@ class GeometryDockWidget(QDockWidget):
             from shapely.geometry import Polygon
             from shapely.ops import unary_union
         except ImportError:
-            self.strata_validation_failed.emit(
-                "缺少 shapely 库, 请执行: pip install shapely"
-            )
+            self.strata_validation_failed.emit("缺少 shapely 库。")
             return
 
         boundary = self._build_slope_boundary_polygon()
         if boundary is None:
-            self.strata_validation_failed.emit("坡体边界无效, 无法裁剪。")
+            self.strata_validation_failed.emit("坡体边界无效。")
             return
 
         try:
@@ -551,158 +1061,118 @@ class GeometryDockWidget(QDockWidget):
 
             clipped = user_poly.intersection(boundary)
             if clipped.is_empty or clipped.area < 0.01:
-                self.strata_validation_failed.emit("绘制的面与边坡土体无交集。")
+                self.strata_validation_failed.emit("绘制的面与坡体无交集。")
                 return
 
             new_polys = self._extract_polygons(clipped)
+            new_polys = [p for p in new_polys if not self._is_sliver(p)]
             if not new_polys:
                 self.strata_validation_failed.emit("裁剪后无有效区域。")
                 return
 
             new_mask = unary_union(new_polys)
 
-            # 已有面 - 新面
             updated_existing = []
+            replaced_count = 0
             for r in self.data_regions:
-                r_pts = r.get("points", [])
-                r_holes = r.get("holes", [])
-                if len(r_pts) < 3:
+                ep = self._to_shapely_polygon(r.get("points", []), r.get("holes", []))
+                if ep is None or ep.is_empty:
+                    continue
+                if not ep.intersects(new_mask):
                     updated_existing.append(r)
                     continue
+
                 try:
-                    ep = self._to_shapely_polygon(r_pts, r_holes)
-                    if ep is None or ep.is_empty:
-                        updated_existing.append(r)
-                        continue
-                    if not ep.intersects(new_mask):
-                        updated_existing.append(r)
-                        continue
-                    diff = ep.difference(new_mask)
-                    if diff.is_empty or diff.area < 0.01:
-                        continue
-                    for piece in self._extract_polygons(diff):
-                        if piece.is_empty or piece.area < 0.01:
-                            continue
-                        new_region = dict(r)
-                        new_region["points"] = [
-                            (float(x), float(y))
-                            for x, y in list(piece.exterior.coords)[:-1]
-                        ]
-                        new_region["holes"] = [
-                            [(float(x), float(y)) for x, y in list(inner.coords)[:-1]]
-                            for inner in piece.interiors
-                        ]
-                        updated_existing.append(new_region)
+                    inter_area = new_mask.intersection(ep).area
+                    overlap_ratio = inter_area / max(ep.area, 1e-9)
                 except Exception:
-                    updated_existing.append(r)
+                    overlap_ratio = 0.0
+
+                if overlap_ratio > self._REPLACE_OVERLAP_RATIO:
+                    replaced_count += 1
+                    continue
+
+                diff = ep.difference(new_mask)
+                if diff.is_empty or diff.area < 0.01:
+                    continue
+
+                for piece in self._extract_polygons(diff):
+                    if piece.is_empty or piece.area < 0.01:
+                        continue
+                    if self._is_sliver(piece):
+                        continue
+                    updated_existing.append(self._polygon_to_region_dict(piece, r))
 
             self.data_regions = updated_existing
 
-            # 追加新面
             pattern = self.combo_region_pattern.currentData() or "solid"
             color = self._PATTERN_COLORS.get(pattern, "#f3dfaa")
             mat_idx = self.combo_region_material.currentIndex()
-            added = 0
+            if mat_idx < 0:
+                mat_idx = 0
+            pct = int(self.slider_hatch_scale.value())
+            pct = max(self.slider_hatch_scale.minimum(),
+                      min(self.slider_hatch_scale.maximum(), pct))
 
+            added = 0
             for poly in new_polys:
                 if poly.is_empty or poly.area < 0.01:
                     continue
                 new_id = len(self.data_regions) + 1
-                self.data_regions.append({
+                region = {
                     "id": new_id,
                     "name": f"土层面 {new_id}",
-                    "points": [
-                        (float(x), float(y))
-                        for x, y in list(poly.exterior.coords)[:-1]
-                    ],
-                    "holes": [
-                        [(float(x), float(y)) for x, y in list(inner.coords)[:-1]]
-                        for inner in poly.interiors
-                    ],
+                    "points": [(float(x), float(y))
+                               for x, y in list(poly.exterior.coords)[:-1]],
+                    "holes": [[(float(x), float(y)) for x, y in list(inner.coords)[:-1]]
+                              for inner in poly.interiors],
                     "material_index": mat_idx,
                     "color": color,
                     "pattern": pattern,
-                })
+                    "hatch_scale_pct": pct,
+                }
+                self.data_regions.append(region)
                 added += 1
 
             for i, r in enumerate(self.data_regions):
                 r["id"] = i + 1
                 r["name"] = f"土层面 {i + 1}"
 
-            self._refresh_region_tree()
-            self.geometry_changed.emit()
-            self.strata_validation_failed.emit(
-                f"已添加 {added} 个新面, 现有 {len(self.data_regions)} 个土层面"
-            )
+            self._refresh_region_tree(keep_selection=False)
+            self._reset_to_ground_view()
+            self._emit_now()
 
+            msg = f"已添加 {added} 个新面"
+            if replaced_count > 0:
+                msg += f", 替换 {replaced_count} 个重叠旧面"
+            msg += "。"
+            self.strata_validation_failed.emit(msg)
         except Exception as e:
-            self.strata_validation_failed.emit(f"添加土层面失败: {e}")
+            self.strata_validation_failed.emit(f"添加失败: {e}")
 
-    # ==================================================================
-    # 应用到当前面
-    # ==================================================================
-    def _get_current_region_index(self):
-        """返回当前选中的面索引, 没有则 -1"""
-        curr = self.tree.currentItem()
-        if curr is None or curr.parent() is not self.item_regions_root:
-            return -1
-        idx = self.item_regions_root.indexOfChild(curr)
-        if 0 <= idx < len(self.data_regions):
-            return idx
-        return -1
-
-    def _on_style_changed(self, _=None):
-        """用户改样式下拉框 → 立即应用到选中面"""
-        idx = self._get_current_region_index()
-        if idx < 0:
-            return
-        pattern = self.combo_region_pattern.currentData() or "solid"
-        color = self._PATTERN_COLORS.get(pattern, "#f3dfaa")
-        self.data_regions[idx]["pattern"] = pattern
-        self.data_regions[idx]["color"] = color
-        self._refresh_region_tree()
-        self.geometry_changed.emit()
-
-    def _on_material_changed(self, _=None):
-        """用户改材料下拉框 → 立即应用到选中面"""
-        idx = self._get_current_region_index()
-        if idx < 0:
-            return
-        mat_idx = self.combo_region_material.currentIndex()
-        self.data_regions[idx]["material_index"] = mat_idx
-        self._refresh_region_tree()
-        self.geometry_changed.emit()
     # ==================================================================
     # 切割
     # ==================================================================
     @staticmethod
-    def _is_line_cut_through_polygon(poly, line, tol=1e-3):
-        from shapely.geometry import Point
+    def _try_cut_polygon(poly, line):
+        """用 line 切割 poly, 返回 (ok, pieces)"""
         try:
-            inside = poly.intersection(line)
+            from shapely.ops import split
+            result = split(poly, line)
         except Exception:
-            return False
-        if inside.is_empty:
-            return False
+            return False, []
 
-        coords = []
-        if inside.geom_type == "LineString":
-            coords = list(inside.coords)
-        elif inside.geom_type == "MultiLineString":
-            for seg in inside.geoms:
-                coords.extend(list(seg.coords))
-        else:
-            return False
+        pieces = []
+        for g in getattr(result, "geoms", []):
+            try:
+                if g.geom_type == "Polygon" and g.area >= 0.01:
+                    pieces.append(g)
+            except Exception:
+                continue
 
-        if len(coords) < 2:
-            return False
-
-        p_start = Point(coords[0])
-        p_end = Point(coords[-1])
-        boundary = poly.boundary
-
-        return (boundary.distance(p_start) < tol and
-                boundary.distance(p_end) < tol)
+        if len(pieces) < 2:
+            return False, []
+        return True, pieces
 
     def apply_cut_line(self, line_points):
         if len(line_points) < 2:
@@ -710,135 +1180,177 @@ class GeometryDockWidget(QDockWidget):
             return
 
         try:
-            from shapely.geometry import LineString, Polygon
-            from shapely.ops import polygonize, unary_union
+            from shapely.geometry import LineString
         except ImportError:
+            self.strata_validation_failed.emit("缺少 shapely 库。")
+            return
+
+        self._save_current_table_data()
+
+        pts = [(float(x), float(y)) for x, y in line_points]
+        if len(pts) < 2:
+            self.strata_validation_failed.emit("切割线至少需要 2 个点。")
+            return
+
+        extended_pts = self._extend_polyline_ends(pts, self._CUT_EXTEND)
+        cut_line = LineString(extended_pts)
+
+        new_regions = []
+        cut_count = 0
+        skipped_count = 0
+
+        for region in self.data_regions:
+            poly = self._to_shapely_polygon(region.get("points", []),
+                                            region.get("holes", []))
+            if poly is None or poly.is_empty:
+                new_regions.append(region)
+                continue
+
+            ok, valid_pieces = self._try_cut_polygon(poly, cut_line)
+            if not ok:
+                new_regions.append(region)
+                skipped_count += 1
+                continue
+
+            valid_pieces = [p for p in valid_pieces if not self._is_sliver(p)]
+            if len(valid_pieces) < 2:
+                new_regions.append(region)
+                skipped_count += 1
+                continue
+
+            cut_count += 1
+            for piece in valid_pieces:
+                new_regions.append(self._polygon_to_region_dict(piece, region))
+
+        for i, r in enumerate(new_regions):
+            r["id"] = i + 1
+            r["name"] = f"土层面 {i + 1}"
+
+        self.data_regions = new_regions
+        self._refresh_region_tree(keep_selection=False)
+        self._reset_to_ground_view()
+        self._emit_now()
+
+        if cut_count == 0:
             self.strata_validation_failed.emit(
-                "缺少 shapely 库, 请执行: pip install shapely"
+                f"切割线未能贯穿任何土层面 (共 {skipped_count} 个面保持原样)。\n"
+                f"提示: 请让线的两端都延伸到坡体外部。"
+            )
+        else:
+            msg = f"切割完成: {cut_count} 个面被切开"
+            if skipped_count > 0:
+                msg += f", {skipped_count} 个面未被贯穿被跳过"
+            msg += f"; 当前共 {len(self.data_regions)} 个土层面"
+            self.strata_validation_failed.emit(msg)
+
+    # ==================================================================
+    # 合并
+    # ==================================================================
+    def merge_selected_regions(self):
+        try:
+            from shapely.ops import unary_union
+        except ImportError:
+            self.strata_validation_failed.emit("缺少 shapely 库。")
+            return
+
+        selected_items = self.tree.selectedItems()
+        indices = sorted({self.item_regions_root.indexOfChild(it)
+                          for it in selected_items
+                          if it.parent() is self.item_regions_root})
+        indices = [i for i in indices if 0 <= i < len(self.data_regions)]
+
+        if len(indices) < 2:
+            self.strata_validation_failed.emit(
+                "请按住 Ctrl 选中至少 2 个土层面, 再点合并。"
             )
             return
 
         self._save_current_table_data()
 
-        # 只切当前选中的面
-        curr = self.tree.currentItem()
-        target_idx = -1
-        if curr is not None and curr.parent() is self.item_regions_root:
-            target_idx = self.item_regions_root.indexOfChild(curr)
+        polys = {}
+        for i in indices:
+            p = self._to_shapely_polygon(
+                self.data_regions[i].get("points", []),
+                self.data_regions[i].get("holes", []))
+            if p is None or p.is_empty:
+                self.strata_validation_failed.emit(f"面 #{i+1} 几何无效。")
+                return
+            polys[i] = p
 
-        if not (0 <= target_idx < len(self.data_regions)):
+        adjacency = {i: set() for i in indices}
+        for a in range(len(indices)):
+            for b in range(a + 1, len(indices)):
+                i, j = indices[a], indices[b]
+                if self._is_adjacent(polys[i], polys[j]):
+                    adjacency[i].add(j)
+                    adjacency[j].add(i)
+
+        visited = set()
+        stack = [indices[0]]
+        while stack:
+            node = stack.pop()
+            if node in visited:
+                continue
+            visited.add(node)
+            stack.extend(adjacency[node] - visited)
+
+        if visited != set(indices):
             self.strata_validation_failed.emit(
-                "请先在图层树里选中一个土层面, 再画切割线。"
+                "选中的面之间不连通 (必须边挨边), 无法合并。"
             )
             return
 
-        # 包围盒
-        all_x, all_y = [], []
-        for region in self.data_regions:
-            for x, y in region.get("points", []):
-                all_x.append(float(x))
-                all_y.append(float(y))
-        if not all_x:
-            self.strata_validation_failed.emit("没有土层面可切割。")
+        names = [self.data_regions[i].get("name", f"土层面 {i+1}") for i in indices]
+        chosen, ok = QInputDialog.getItem(
+            self, "选择主土层",
+            "新面将继承哪个面的属性 (材料 / 填充样式 / 名称)?",
+            names, 0, False)
+        if not ok:
             return
 
-        min_x, max_x = min(all_x), max(all_x)
-        min_y, max_y = min(all_y), max(all_y)
-        span = max(max_x - min_x, max_y - min_y)
-        extend = span * 2.0 + 10.0
+        master_idx = indices[names.index(chosen)]
+        master_region = self.data_regions[master_idx]
 
-        # 首尾延长 + 保留中间点
-        pts = [(float(x), float(y)) for x, y in line_points]
+        try:
+            merged_geom = unary_union([polys[i] for i in indices])
+        except Exception as e:
+            self.strata_validation_failed.emit(f"合并失败: {e}")
+            return
 
-        x0, y0 = pts[0]
-        x1, y1 = pts[1]
-        dx0, dy0 = x0 - x1, y0 - y1
-        L0 = (dx0 * dx0 + dy0 * dy0) ** 0.5
-        ext_start = ((x0 + dx0 / L0 * extend, y0 + dy0 / L0 * extend)
-                     if L0 > 1e-6 else (x0, y0))
+        merged_geom = self._close_geometry(merged_geom, self._MERGE_CLOSE_DELTA)
 
-        xn, yn = pts[-1]
-        xn1, yn1 = pts[-2]
-        dxn, dyn = xn - xn1, yn - yn1
-        Ln = (dxn * dxn + dyn * dyn) ** 0.5
-        ext_end = ((xn + dxn / Ln * extend, yn + dyn / Ln * extend)
-                   if Ln > 1e-6 else (xn, yn))
+        merged_polys = self._extract_polygons(merged_geom)
+        final_regions = [self._polygon_to_region_dict(p, master_region)
+                         for p in merged_polys
+                         if not p.is_empty and p.area >= 0.01
+                         and not self._is_sliver(p)]
 
-        cut_line = LineString([ext_start] + pts + [ext_end])
-
-        # 只切选中的面, 其他原样
-        new_regions = []
-        cut_count = 0
-
-        for i, region in enumerate(self.data_regions):
-            if i != target_idx:
-                new_regions.append(region)
-                continue
-
-            r_pts = region.get("points", [])
-            r_holes = region.get("holes", [])
-            if len(r_pts) < 3:
-                new_regions.append(region)
-                continue
-
-            try:
-                poly = self._to_shapely_polygon(r_pts, r_holes)
-                if poly is None or poly.is_empty:
-                    new_regions.append(region)
-                    continue
-
-                if not self._is_line_cut_through_polygon(poly, cut_line):
-                    new_regions.append(region)
-                    continue
-
-                merged = unary_union([poly.boundary, cut_line])
-                pieces = list(polygonize(merged))
-
-                valid_pieces = []
-                for p in pieces:
-                    if p.is_empty or p.area < 0.01:
-                        continue
-                    if not poly.buffer(1e-6).contains(p.centroid):
-                        continue
-                    valid_pieces.append(p)
-
-                if len(valid_pieces) < 2:
-                    new_regions.append(region)
-                    continue
-
-                cut_count += 1
-                for piece in valid_pieces:
-                    new_region = dict(region)
-                    new_region["points"] = [
-                        (float(x), float(y))
-                        for x, y in list(piece.exterior.coords)[:-1]
-                    ]
-                    new_region["holes"] = [
-                        [(float(x), float(y)) for x, y in list(inner.coords)[:-1]]
-                        for inner in piece.interiors
-                    ]
-                    new_regions.append(new_region)
-            except Exception as e:
-                self.strata_validation_failed.emit(f"切割失败: {e}")
-                new_regions.append(region)
-
-        for i, region in enumerate(new_regions):
-            region["id"] = i + 1
-            region["name"] = f"土层面 {i + 1}"
-
-        self.data_regions = new_regions
-        self._refresh_region_tree()
-        self.geometry_changed.emit()
-
-        if cut_count == 0:
+        if not final_regions:
             self.strata_validation_failed.emit(
-                f"切割线未完全贯穿选中的面, 未做修改。"
+                "合并后只剩下碎片, 已取消操作 (原面保留)。"
             )
-        else:
-            self.strata_validation_failed.emit(
-                f"切割完成: {cut_count} 个面被切开, 当前共 "
-                f"{len(self.data_regions)} 个土层面"
-            )
+            return
+
+        new_data = []
+        for i, r in enumerate(self.data_regions):
+            if i == master_idx:
+                new_data.extend(final_regions)
+            elif i in indices:
+                continue
+            else:
+                new_data.append(r)
+
+        for k, r in enumerate(new_data):
+            r["id"] = k + 1
+
+        self.data_regions = new_data
+
+        self._refresh_region_tree(keep_selection=False)
+        self._reset_to_ground_view()
+        self._emit_now()
+        self.strata_validation_failed.emit(
+            f"已合并 {len(indices)} 个土层面, 当前共 {len(self.data_regions)} 个。"
+        )
 
     # ==================================================================
     # 填充空洞
@@ -847,149 +1359,270 @@ class GeometryDockWidget(QDockWidget):
         try:
             from shapely.ops import unary_union
         except ImportError:
-            self.strata_validation_failed.emit(
-                "缺少 shapely 库, 请执行: pip install shapely"
-            )
+            self.strata_validation_failed.emit("缺少 shapely 库。")
             return
 
-        boundary = self._build_slope_boundary_polygon()
-        if boundary is None or boundary.is_empty:
-            self.strata_validation_failed.emit("坡体边界无效。")
-            return
+        try:
+            self._ground_dirty = False
 
-        region_polys = []
-        for r in self.data_regions:
-            p = self._to_shapely_polygon(
-                r.get("points", []), r.get("holes", [])
-            )
-            if p is not None and not p.is_empty:
-                region_polys.append(p)
+            boundary = self._build_slope_boundary_polygon()
+            if boundary is None or boundary.is_empty:
+                self.strata_validation_failed.emit("坡体边界无效。")
+                return
 
-        if not region_polys:
-            self.strata_validation_failed.emit("没有有效的土层面。")
-            return
+            boundary_polys = self._extract_polygons(boundary)
+            if not boundary_polys:
+                return
+            boundary = max(boundary_polys, key=lambda p: p.area)
 
-        covered = unary_union(region_polys)
-        holes = boundary.difference(covered)
+            region_polys = []
+            for i, r in enumerate(self.data_regions):
+                p = self._to_shapely_polygon(r.get("points", []),
+                                             r.get("holes", []))
+                if p is not None and not p.is_empty and p.area >= 0.001:
+                    region_polys.append((i, p))
 
-        if holes.is_empty or holes.area < 0.01:
-            self.strata_validation_failed.emit("没有发现土层空洞。")
-            return
+            if not region_polys:
+                self.strata_validation_failed.emit("没有有效的土层面。")
+                return
 
-        hole_polys = self._extract_polygons(holes)
+            region_polys_by_idx = {i: p for i, p in region_polys}
 
-        pattern = self.combo_region_pattern.currentData() or "solid"
-        color = self._PATTERN_COLORS.get(pattern, "#f3dfaa")
-        added = 0
+            covered = unary_union([p for _, p in region_polys])
+            if not covered.is_valid:
+                covered = covered.buffer(0)
+            covered = self._close_geometry(covered, self._MERGE_CLOSE_DELTA)
 
-        for hp in hole_polys:
-            if hp.is_empty or hp.area < 0.01:
-                continue
-            new_id = len(self.data_regions) + 1
-            self.data_regions.append({
-                "id": new_id,
-                "name": f"填充层 {new_id}",
-                "points": [
-                    (float(x), float(y))
-                    for x, y in list(hp.exterior.coords)[:-1]
-                ],
-                "holes": [
-                    [(float(x), float(y)) for x, y in list(inner.coords)[:-1]]
-                    for inner in hp.interiors
-                ],
-                "material_index": 0,
-                "color": color,
-                "pattern": pattern,
-            })
-            added += 1
+            holes = boundary.difference(covered)
+            if holes is None or holes.is_empty or holes.area < 0.01:
+                self.strata_validation_failed.emit("没有发现土层空洞。")
+                return
 
-        if added == 0:
-            self.strata_validation_failed.emit("未找到可填充的空洞。")
-            return
+            hole_polys = self._extract_polygons(holes)
 
-        self._refresh_region_tree()
-        self.geometry_changed.emit()
-        self.strata_validation_failed.emit(f"已填充 {added} 个土层空洞。")
+            pattern = self.combo_region_pattern.currentData() or "solid"
+            color = self._PATTERN_COLORS.get(pattern, "#f3dfaa")
+            mat_idx = self.combo_region_material.currentIndex()
+            if mat_idx < 0:
+                mat_idx = 0
+
+            extra_shapes = {}
+            appended = []
+            skipped = 0
+
+            for hp in hole_polys:
+                if hp is None or hp.is_empty or not hp.is_valid:
+                    skipped += 1
+                    continue
+                if hp.area < 0.01:
+                    skipped += 1
+                    continue
+                if self._is_sliver(hp):
+                    skipped += 1
+                    continue
+
+                exterior = list(hp.exterior.coords)[:-1]
+                if len(exterior) < 3:
+                    skipped += 1
+                    continue
+
+                best_idx = -1
+                best_len = 0.0
+                for i, p in region_polys:
+                    L = self._contact_length(hp, p)
+                    if L > best_len:
+                        best_len = L
+                        best_idx = i
+
+                if best_idx >= 0 and best_len > self._ADJACENCY_DIST_TOL:
+                    extra_shapes.setdefault(best_idx, []).append(hp)
+                    continue
+
+                clean_outer = []
+                bad = False
+                for x, y in exterior:
+                    if not (np.isfinite(x) and np.isfinite(y)):
+                        bad = True
+                        break
+                    clean_outer.append((float(x), float(y)))
+                if bad or len(clean_outer) < 3:
+                    skipped += 1
+                    continue
+
+                clean_holes = []
+                for inner in hp.interiors:
+                    inner_pts = list(inner.coords)[:-1]
+                    if len(inner_pts) < 3:
+                        continue
+                    ok = True
+                    cpts = []
+                    for x, y in inner_pts:
+                        if not (np.isfinite(x) and np.isfinite(y)):
+                            ok = False
+                            break
+                        cpts.append((float(x), float(y)))
+                    if ok and len(cpts) >= 3:
+                        clean_holes.append(cpts)
+
+                appended.append({
+                    "points": clean_outer,
+                    "holes": clean_holes,
+                    "material_index": mat_idx,
+                    "color": color,
+                    "pattern": pattern,
+                })
+
+            merged_count = 0
+            for idx, extra_list in extra_shapes.items():
+                original = region_polys_by_idx.get(idx)
+                if original is None:
+                    continue
+                try:
+                    combined = unary_union([original] + extra_list)
+                except Exception:
+                    continue
+
+                combined = self._close_geometry(combined, self._MERGE_CLOSE_DELTA)
+                pieces = [
+                    p for p in self._extract_polygons(combined)
+                    if not p.is_empty
+                    and p.area >= 0.01
+                    and not self._is_sliver(p)
+                ]
+                if not pieces:
+                    continue
+
+                biggest = max(pieces, key=lambda p: p.area)
+                master = self.data_regions[idx]
+                self.data_regions[idx] = self._polygon_to_region_dict(biggest, master)
+                merged_count += 1
+
+            appended_count = 0
+            for item in appended:
+                new_id = len(self.data_regions) + 1
+                self.data_regions.append({
+                    "id": new_id,
+                    "name": f"土层面 {new_id}",
+                    "points": item["points"],
+                    "holes": item["holes"],
+                    "material_index": item["material_index"],
+                    "color": item["color"],
+                    "pattern": item["pattern"],
+                })
+                appended_count += 1
+
+            if merged_count == 0 and appended_count == 0:
+                self.strata_validation_failed.emit(
+                    f"未填充任何区域 (跳过 {skipped} 个退化几何)。"
+                )
+                return
+
+            for i, r in enumerate(self.data_regions):
+                r["id"] = i + 1
+                r["name"] = f"土层面 {i + 1}"
+
+            self._refresh_region_tree(keep_selection=False)
+            self._reset_to_ground_view()
+            self._emit_now()
+
+            msg_parts = []
+            if merged_count > 0:
+                msg_parts.append(f"已合并 {merged_count} 个空洞至相邻土层")
+            if appended_count > 0:
+                msg_parts.append(f"独立生成 {appended_count} 个新土层面")
+            msg = ", ".join(msg_parts)
+            if skipped > 0:
+                msg += f" (跳过 {skipped} 个退化几何)"
+            msg += f"; 当前共 {len(self.data_regions)} 个土层面。"
+            self.strata_validation_failed.emit(msg)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.strata_validation_failed.emit(f"填充失败: {e}")
 
     # ==================================================================
     # 图层树刷新
     # ==================================================================
     def _refresh_region_tree(self, keep_selection: bool = True):
-        """重绘土层面对应的树节点
+        self.tree.blockSignals(True)
+        try:
+            prev_selected = set()
+            if keep_selection:
+                for item in self.tree.selectedItems():
+                    if item.parent() is self.item_regions_root:
+                        prev_selected.add(self.item_regions_root.indexOfChild(item))
 
-        keep_selection=True: 刷新后保持当前选中的节点 (默认)
-        """
-        # ---- 记录当前选中 ----
-        prev_item = self.tree.currentItem() if keep_selection else None
-        prev_key = self.current_editing_key if keep_selection else None
+            while self.item_regions_root.childCount() > 0:
+                self.item_regions_root.removeChild(self.item_regions_root.child(0))
 
-        # ---- 重建 ----
-        while self.item_regions_root.childCount() > 0:
-            self.item_regions_root.removeChild(self.item_regions_root.child(0))
+            for region in self.data_regions:
+                pts = region.get("points", [])
+                holes = region.get("holes", [])
+                color = region.get("color", "#f3dfaa")
+                mat_idx = int(region.get("material_index", 0))
+                mat_name = (self.combo_region_material.itemText(mat_idx)
+                            if 0 <= mat_idx < self.combo_region_material.count()
+                            else f"材料 {mat_idx + 1}")
 
-        for region in self.data_regions:
-            pts = region.get("points", [])
-            holes = region.get("holes", [])
-            color = region.get("color", "#f3dfaa")
-            mat_idx = int(region.get("material_index", 0))
+                label = region.get("name", "土层面")
+                if holes:
+                    label += f" ({len(holes)}洞)"
 
-            mat_name = (
-                self.combo_region_material.itemText(mat_idx)
-                if 0 <= mat_idx < self.combo_region_material.count()
-                else f"材料 {mat_idx + 1}"
-            )
+                item = QTreeWidgetItem([label, str(len(pts)), mat_name])
+                item.setBackground(0, QBrush(QColor(color)))
+                item.setTextAlignment(1, Qt.AlignCenter)
+                item.setTextAlignment(2, Qt.AlignCenter)
+                self.item_regions_root.addChild(item)
 
-            label = region.get("name", "土层面")
-            if holes:
-                label += f" ({len(holes)}洞)"
+            self.item_regions_root.setText(1, str(len(self.data_regions)))
+            self.item_regions_root.setExpanded(True)
 
-            item = QTreeWidgetItem([label, str(len(pts)), mat_name])
-            item.setBackground(0, QBrush(QColor(color)))
-            item.setTextAlignment(1, Qt.AlignCenter)
-            self.item_regions_root.addChild(item)
+            if prev_selected:
+                for idx in prev_selected:
+                    if 0 <= idx < self.item_regions_root.childCount():
+                        self.item_regions_root.child(idx).setSelected(True)
+                first = min(prev_selected)
+                if 0 <= first < self.item_regions_root.childCount():
+                    self.tree.setCurrentItem(self.item_regions_root.child(first))
+        finally:
+            self.tree.blockSignals(False)
 
-        self.item_regions_root.setText(1, str(len(self.data_regions)))
-        self.item_regions_root.setExpanded(True)
-
-        # ---- 恢复选中 ----
-        if keep_selection and prev_key and prev_key.startswith("region_"):
-            try:
-                idx = int(prev_key.split("_")[1])
-                if 0 <= idx < self.item_regions_root.childCount():
-                    # 临时阻断信号, 避免触发 _on_tree_selection_changed 里的
-                    # "同步下拉框/加载表格" 逻辑 (那会导致下拉框被重置)
-                    self.tree.blockSignals(True)
-                    self.tree.setCurrentItem(
-                        self.item_regions_root.child(idx)
-                    )
-                    self.tree.blockSignals(False)
-            except Exception:
-                pass
     # ==================================================================
-    # 删除当前实体
+    # 删除
     # ==================================================================
     def _del_current_entity(self):
+        selected_items = self.tree.selectedItems()
+        region_indices = sorted({self.item_regions_root.indexOfChild(it)
+                                 for it in selected_items
+                                 if it.parent() is self.item_regions_root},
+                                reverse=True)
+
+        if region_indices:
+            for idx in region_indices:
+                if 0 <= idx < len(self.data_regions):
+                    self.data_regions.pop(idx)
+            self._refresh_region_tree(keep_selection=False)
+            self._reset_to_ground_view()
+            self._emit_now()
+            self.strata_validation_failed.emit(
+                f"已删除 {len(region_indices)} 个土层面。"
+            )
+            return
+
         curr = self.tree.currentItem()
         if curr is None:
             return
-
-        if curr.parent() is self.item_regions_root:
-            idx = self.item_regions_root.indexOfChild(curr)
-            if 0 <= idx < len(self.data_regions):
-                self.data_regions.pop(idx)
-                self._refresh_region_tree()
-                self.tree.setCurrentItem(self.item_ground)
-                self.geometry_changed.emit()
-            return
-
         if curr is self.item_ground:
             self.strata_validation_failed.emit("地表轮廓线不可删除。")
             return
-
         if curr is self.item_water:
-            self.data_water = None
-            self.item_water.setText(1, "0")
-            self.geometry_changed.emit()
+            self.data_water = []
+            self._clip_water_to_ground()
+            self.item_water.setText(1, str(len(self.data_water)))
+            self._reset_to_ground_view()
+            self._emit_now()
+            self.strata_validation_failed.emit("已重置为默认水位线。")
             return
 
     # ==================================================================
@@ -1013,11 +1646,26 @@ class GeometryDockWidget(QDockWidget):
 
     def get_water_points(self):
         self._save_current_table_data()
+        if not self.data_water:
+            return None
         return self.data_water
 
     def get_layer_regions(self):
         self._save_current_table_data()
         return self.data_regions
+
+    def select_region_by_index(self, region_index: int):
+        if not (0 <= region_index < self.item_regions_root.childCount()):
+            return
+        item = self.item_regions_root.child(region_index)
+        if item is not None:
+            self.tree.setCurrentItem(item)
+
+    def select_special_entity(self, tag: int):
+        if tag == self.TAG_GROUND:
+            self.tree.setCurrentItem(self.item_ground)
+        elif tag == self.TAG_WATER:
+            self.tree.setCurrentItem(self.item_water)
 
     # ==================================================================
     # 持久化
@@ -1028,15 +1676,15 @@ class GeometryDockWidget(QDockWidget):
             "ground": [list(p) for p in self.data_ground],
             "water": [list(p) for p in self.data_water] if self.data_water else None,
             "regions": [
-                {
-                    **{k: v for k, v in r.items() if k not in ("points", "holes")},
-                    "points": [list(p) for p in r.get("points", [])],
-                    "holes": [[list(p) for p in h] for h in r.get("holes", [])],
-                }
+                {**{k: v for k, v in r.items() if k not in ("points", "holes")},
+                 "points": [list(p) for p in r.get("points", [])],
+                 "holes": [[list(p) for p in h] for h in r.get("holes", [])]}
                 for r in self.data_regions
             ],
             "snap_tolerance": self.spin_snap_tol.value(),
             "snap_mode": self.combo_snap_mode.currentData() or "both",
+            "hatch_scale": self.slider_hatch_scale.value(),
+            "bottom_depth": self._bottom_depth,     # ★ 新增
         }
 
     def from_dict(self, data):
@@ -1048,7 +1696,7 @@ class GeometryDockWidget(QDockWidget):
         if data.get("water"):
             self.data_water = [(float(x), float(y)) for x, y in data["water"]]
         else:
-            self.data_water = None
+            self.data_water = []
 
         self.data_regions = []
         for r in data.get("regions", []) or []:
@@ -1067,6 +1715,7 @@ class GeometryDockWidget(QDockWidget):
                 "material_index": int(r.get("material_index", 0)),
                 "color": str(r.get("color", "#f3dfaa")),
                 "pattern": str(r.get("pattern", "solid")),
+                "hatch_scale_pct": int(r.get("hatch_scale_pct", 100)),
             })
 
         if not self.data_regions:
@@ -1080,10 +1729,17 @@ class GeometryDockWidget(QDockWidget):
                 if self.combo_snap_mode.itemData(i) == mode:
                     self.combo_snap_mode.setCurrentIndex(i)
                     break
+        if "hatch_scale" in data:
+            self.slider_hatch_scale.setValue(int(data["hatch_scale"]))
+        if "bottom_depth" in data:
+            self.spin_bottom_depth.blockSignals(True)
+            self.spin_bottom_depth.setValue(float(data["bottom_depth"]))
+            self._bottom_depth = float(data["bottom_depth"])
+            self.spin_bottom_depth.blockSignals(False)
 
-        self._refresh_region_tree()
-        self.tree.setCurrentItem(self.item_ground)
-        self._load_table_data(self.data_ground)
+        self._clip_water_to_ground()
+        self._refresh_region_tree(keep_selection=False)
+        self._reset_to_ground_view()
 
 class MaterialDockWidget(QDockWidget):
     """土层材料库与物理力学参数停靠窗 (动态材料列表)
@@ -1382,7 +2038,7 @@ class MaterialDockWidget(QDockWidget):
         if layers:
             self.materials_db = [
                 SoilMaterial(
-                    name=L.get("name", f"材料 {i+1}"),
+                    name=L.get("name", f"材料 {i + 1}"),
                     gamma_dry=float(L.get("gamma_dry", 19.0)),
                     gamma_sat=float(L.get("gamma_sat", 21.0)),
                     c_prime=float(L.get("c_prime", 15.0)),
@@ -1409,8 +2065,8 @@ class MaterialDockWidget(QDockWidget):
         )
         self._refresh_material_table()
         self._load_material_params(self.current_material_index)
-        
-        
+
+
 class RainfallDockWidget(QDockWidget):
     """动态时序降雨过程与时间轴控制停靠窗"""
     time_step_changed = pyqtSignal(float)
@@ -1441,8 +2097,12 @@ class RainfallDockWidget(QDockWidget):
         v_s = QVBoxLayout(grp_slider)
 
         f_infil = QFormLayout()
-        self.spin_ks = QDoubleSpinBox(); self.spin_ks.setValue(15.0); self.spin_ks.setSuffix(" mm/h")
-        self.spin_theta = QDoubleSpinBox(); self.spin_theta.setValue(0.20); self.spin_theta.setSingleStep(0.05)
+        self.spin_ks = QDoubleSpinBox();
+        self.spin_ks.setValue(15.0);
+        self.spin_ks.setSuffix(" mm/h")
+        self.spin_theta = QDoubleSpinBox();
+        self.spin_theta.setValue(0.20);
+        self.spin_theta.setSingleStep(0.05)
         f_infil.addRow("饱和渗透系数 (Ks):", self.spin_ks)
         f_infil.addRow("有效储水空隙增量 (Δθ):", self.spin_theta)
         v_s.addLayout(f_infil)
@@ -1470,7 +2130,7 @@ class RainfallDockWidget(QDockWidget):
 
         layout.addWidget(grp_slider, stretch=4)
         self.setWidget(container)
-        
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "series": [[float(t), float(i)] for t, i in self._get_time_series_data()],
@@ -1538,9 +2198,18 @@ class LoadsDockWidget(QDockWidget):
 
         grp_load = QGroupBox("坡顶附加荷载")
         form_load = QFormLayout()
-        self.spin_q = QDoubleSpinBox(); self.spin_q.setRange(0.0, 500.0); self.spin_q.setValue(0.0); self.spin_q.setSuffix(" kPa")
-        self.spin_qx1 = QDoubleSpinBox(); self.spin_qx1.setRange(-50, 100); self.spin_qx1.setValue(5.0); self.spin_qx1.setSuffix(" m")
-        self.spin_qx2 = QDoubleSpinBox(); self.spin_qx2.setRange(-50, 100); self.spin_qx2.setValue(18.0); self.spin_qx2.setSuffix(" m")
+        self.spin_q = QDoubleSpinBox();
+        self.spin_q.setRange(0.0, 500.0);
+        self.spin_q.setValue(0.0);
+        self.spin_q.setSuffix(" kPa")
+        self.spin_qx1 = QDoubleSpinBox();
+        self.spin_qx1.setRange(-50, 100);
+        self.spin_qx1.setValue(5.0);
+        self.spin_qx1.setSuffix(" m")
+        self.spin_qx2 = QDoubleSpinBox();
+        self.spin_qx2.setRange(-50, 100);
+        self.spin_qx2.setValue(18.0);
+        self.spin_qx2.setSuffix(" m")
         form_load.addRow("荷载强度 (q):", self.spin_q)
         form_load.addRow("分布起点 X1:", self.spin_qx1)
         form_load.addRow("分布终点 X2:", self.spin_qx2)
@@ -1549,7 +2218,10 @@ class LoadsDockWidget(QDockWidget):
 
         grp_seismic = QGroupBox("拟静力法地震惯性力")
         form_seismic = QFormLayout()
-        self.spin_kh = QDoubleSpinBox(); self.spin_kh.setRange(0.0, 0.4); self.spin_kh.setValue(0.0); self.spin_kh.setSingleStep(0.02)
+        self.spin_kh = QDoubleSpinBox();
+        self.spin_kh.setRange(0.0, 0.4);
+        self.spin_kh.setValue(0.0);
+        self.spin_kh.setSingleStep(0.02)
         form_seismic.addRow("水平地震力系数 (kh):", self.spin_kh)
         grp_seismic.setLayout(form_seismic)
         layout.addWidget(grp_seismic)
@@ -1570,7 +2242,7 @@ class LoadsDockWidget(QDockWidget):
 
     def get_seismic_kh(self) -> float:
         return self.spin_kh.value()
-    
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "q": self.spin_q.value(),
@@ -1629,10 +2301,22 @@ class SearchDockWidget(QDockWidget):
         # ---------- 2. 圆弧几何参数 ----------
         self.grp_circle = QGroupBox("圆弧几何参数 (指定滑面)")
         form_circle = QFormLayout()
-        self.spin_xc = QDoubleSpinBox(); self.spin_xc.setRange(-200.0, 500.0); self.spin_xc.setValue(25.0); self.spin_xc.setSuffix(" m")
-        self.spin_yc = QDoubleSpinBox(); self.spin_yc.setRange(-200.0, 500.0); self.spin_yc.setValue(22.0); self.spin_yc.setSuffix(" m")
-        self.spin_r = QDoubleSpinBox(); self.spin_r.setRange(1.0, 500.0); self.spin_r.setValue(23.0); self.spin_r.setSuffix(" m")
-        self.spin_slices = QSpinBox(); self.spin_slices.setRange(10, 150); self.spin_slices.setValue(30); self.spin_slices.setSuffix(" 个")
+        self.spin_xc = QDoubleSpinBox();
+        self.spin_xc.setRange(-200.0, 500.0);
+        self.spin_xc.setValue(25.0);
+        self.spin_xc.setSuffix(" m")
+        self.spin_yc = QDoubleSpinBox();
+        self.spin_yc.setRange(-200.0, 500.0);
+        self.spin_yc.setValue(22.0);
+        self.spin_yc.setSuffix(" m")
+        self.spin_r = QDoubleSpinBox();
+        self.spin_r.setRange(1.0, 500.0);
+        self.spin_r.setValue(23.0);
+        self.spin_r.setSuffix(" m")
+        self.spin_slices = QSpinBox();
+        self.spin_slices.setRange(10, 150);
+        self.spin_slices.setValue(30);
+        self.spin_slices.setSuffix(" 个")
         form_circle.addRow("滑弧圆心 Xc:", self.spin_xc)
         form_circle.addRow("滑弧圆心 Yc:", self.spin_yc)
         form_circle.addRow("滑弧半径 R:", self.spin_r)
@@ -1723,16 +2407,37 @@ class SearchDockWidget(QDockWidget):
         self.lbl_b1 = QLabel("Xc 搜索范围 (m):")
         self.lbl_b2 = QLabel("Yc 搜索范围 (m):")
         self.lbl_b3 = QLabel("半径 R 范围 (m):")
-        self.spin_b1_min = QDoubleSpinBox(); self.spin_b1_min.setRange(-500, 500); self.spin_b1_min.setValue(10.0)
-        self.spin_b1_max = QDoubleSpinBox(); self.spin_b1_max.setRange(-500, 500); self.spin_b1_max.setValue(45.0)
-        self.spin_b2_min = QDoubleSpinBox(); self.spin_b2_min.setRange(-500, 500); self.spin_b2_min.setValue(15.0)
-        self.spin_b2_max = QDoubleSpinBox(); self.spin_b2_max.setRange(-500, 500); self.spin_b2_max.setValue(40.0)
-        self.spin_b3_min = QDoubleSpinBox(); self.spin_b3_min.setRange(-500, 500); self.spin_b3_min.setValue(10.0)
-        self.spin_b3_max = QDoubleSpinBox(); self.spin_b3_max.setRange(-500, 500); self.spin_b3_max.setValue(45.0)
+        self.spin_b1_min = QDoubleSpinBox();
+        self.spin_b1_min.setRange(-500, 500);
+        self.spin_b1_min.setValue(10.0)
+        self.spin_b1_max = QDoubleSpinBox();
+        self.spin_b1_max.setRange(-500, 500);
+        self.spin_b1_max.setValue(45.0)
+        self.spin_b2_min = QDoubleSpinBox();
+        self.spin_b2_min.setRange(-500, 500);
+        self.spin_b2_min.setValue(15.0)
+        self.spin_b2_max = QDoubleSpinBox();
+        self.spin_b2_max.setRange(-500, 500);
+        self.spin_b2_max.setValue(40.0)
+        self.spin_b3_min = QDoubleSpinBox();
+        self.spin_b3_min.setRange(-500, 500);
+        self.spin_b3_min.setValue(10.0)
+        self.spin_b3_max = QDoubleSpinBox();
+        self.spin_b3_max.setRange(-500, 500);
+        self.spin_b3_max.setValue(45.0)
 
-        h_b1 = QHBoxLayout(); h_b1.addWidget(self.spin_b1_min); h_b1.addWidget(QLabel("~")); h_b1.addWidget(self.spin_b1_max)
-        h_b2 = QHBoxLayout(); h_b2.addWidget(self.spin_b2_min); h_b2.addWidget(QLabel("~")); h_b2.addWidget(self.spin_b2_max)
-        h_b3 = QHBoxLayout(); h_b3.addWidget(self.spin_b3_min); h_b3.addWidget(QLabel("~")); h_b3.addWidget(self.spin_b3_max)
+        h_b1 = QHBoxLayout();
+        h_b1.addWidget(self.spin_b1_min);
+        h_b1.addWidget(QLabel("~"));
+        h_b1.addWidget(self.spin_b1_max)
+        h_b2 = QHBoxLayout();
+        h_b2.addWidget(self.spin_b2_min);
+        h_b2.addWidget(QLabel("~"));
+        h_b2.addWidget(self.spin_b2_max)
+        h_b3 = QHBoxLayout();
+        h_b3.addWidget(self.spin_b3_min);
+        h_b3.addWidget(QLabel("~"));
+        h_b3.addWidget(self.spin_b3_max)
 
         self.form_algo.addRow(self.lbl_b1, h_b1)
         self.form_algo.addRow(self.lbl_b2, h_b2)
@@ -1772,7 +2477,8 @@ class SearchDockWidget(QDockWidget):
         # ---------- 8. 定向执行分析主按钮 ----------
         self.btn_run_all = QPushButton("执行稳定性分析 (所选模型)")
         self.btn_run_all.setIcon(get_icon("run_solvers"))
-        self.btn_run_all.setStyleSheet("background-color: #27ae60; color: white; font-weight: bold; font-size: 13px; padding: 8px;")
+        self.btn_run_all.setStyleSheet(
+            "background-color: #27ae60; color: white; font-weight: bold; font-size: 13px; padding: 8px;")
         self.btn_run_all.clicked.connect(self.calculate_requested.emit)
         layout.addWidget(self.btn_run_all)
 
@@ -1947,7 +2653,7 @@ class SearchDockWidget(QDockWidget):
             "circle": {
                 "xc": self.spin_xc.value(),
                 "yc": self.spin_yc.value(),
-                "R":  self.spin_r.value(),
+                "R": self.spin_r.value(),
                 "n_slices": self.spin_slices.value(),
             },
             "polygon": [list(p) for p in self.get_poly_points()],
@@ -1994,9 +2700,9 @@ class SearchDockWidget(QDockWidget):
         # 搜索包络
         b = data.get("search_bounds", {}) or {}
         for key, spin_min, spin_max in (
-            ("b1", self.spin_b1_min, self.spin_b1_max),
-            ("b2", self.spin_b2_min, self.spin_b2_max),
-            ("b3", self.spin_b3_min, self.spin_b3_max),
+                ("b1", self.spin_b1_min, self.spin_b1_max),
+                ("b2", self.spin_b2_min, self.spin_b2_max),
+                ("b3", self.spin_b3_min, self.spin_b3_max),
         ):
             pair = b.get(key)
             if pair and len(pair) == 2:
@@ -2013,10 +2719,11 @@ class SearchDockWidget(QDockWidget):
 
         # 让界面根据类型刷新
         self._on_surface_type_changed(self.combo_surface_type.currentIndex())
-        
-        
+
+
 class ResultsDockWidget(QDockWidget):
     """计算结果、降雨时程与微元表格停靠窗"""
+
     def __init__(self, parent=None):
         super().__init__("计算成果与切片受力核查", parent)
         self.setAllowedAreas(Qt.BottomDockWidgetArea | Qt.RightDockWidgetArea)
@@ -2031,7 +2738,8 @@ class ResultsDockWidget(QDockWidget):
         self.tabs.addTab(self.tbl_summary, "经典 LEM 模型对比表")
 
         self.tbl_time_series = QTableWidget(0, 4)
-        self.tbl_time_series.setHorizontalHeaderLabels(["降雨历时 t (h)", "降雨强度 (mm/h)", "湿润锋深度 zf (m)", "安全系数 Fs (Bishop)"])
+        self.tbl_time_series.setHorizontalHeaderLabels(
+            ["降雨历时 t (h)", "降雨强度 (mm/h)", "湿润锋深度 zf (m)", "安全系数 Fs (Bishop)"])
         self.tbl_time_series.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.tabs.addTab(self.tbl_time_series, "降雨历时稳定性衰减 Fs(t)")
 
@@ -2095,7 +2803,7 @@ class ResultsDockWidget(QDockWidget):
             self.tbl_slices.setItem(r, 12, QTableWidgetItem(f"{np.degrees(s.phi):.1f}"))
             self.tbl_slices.setItem(r, 13, QTableWidgetItem(f"{np.degrees(s.alpha):.2f}"))
             self.tbl_slices.setItem(r, 14, QTableWidgetItem(f"{s.l:.2f}"))
-            
+
     def get_poly_points(self):
         """从折线表格读回所有点 (供保存使用)"""
         pts = []
@@ -2156,9 +2864,9 @@ class ResultsDockWidget(QDockWidget):
         # 搜索包络
         b = data.get("search_bounds", {}) or {}
         for key, spin_min, spin_max in (
-            ("b1", self.spin_b1_min, self.spin_b1_max),
-            ("b2", self.spin_b2_min, self.spin_b2_max),
-            ("b3", self.spin_b3_min, self.spin_b3_max),
+                ("b1", self.spin_b1_min, self.spin_b1_max),
+                ("b2", self.spin_b2_min, self.spin_b2_max),
+                ("b3", self.spin_b3_min, self.spin_b3_max),
         ):
             pair = b.get(key, None)
             if pair and len(pair) == 2:
@@ -2176,7 +2884,7 @@ class ResultsDockWidget(QDockWidget):
         # 让界面根据类型刷新一次
         self._on_surface_type_changed(self.combo_surface_type.currentIndex())
 
-    
+
 class ReliabilityDockWidget(QDockWidget):
     """边坡可靠度指标与失效概率评价停靠窗 (CAD/CAE 风格)"""
     reliability_requested = pyqtSignal()
@@ -2344,7 +3052,7 @@ class ReliabilityDockWidget(QDockWidget):
         else:
             self.lbl_fs_range.setText("点估计法不提供极值样本")
             self.lbl_fail_counts.setText("解析点估计近似估算")
-            
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "rel_method": self.combo_rel_method.currentIndex(),
@@ -2370,6 +3078,7 @@ class ReliabilityDockWidget(QDockWidget):
         if "dist_phi" in data:     self.combo_dist_phi.setCurrentIndex(int(data["dist_phi"]))
         if "rho" in data:          self.spin_rho.setValue(float(data["rho"]))
         if "cov_gamma" in data:    self.spin_cov_gamma.setValue(float(data["cov_gamma"]))
+
 
 class ReinforcementDockWidget(QDockWidget):
     """边坡防治措施与支护构件管理停靠窗"""
