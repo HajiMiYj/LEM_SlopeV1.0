@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 土条离散剖分器模块
-支持多层地层自重积分、降雨入渗湿润锋、非饱和基质吸力表观黏聚力、坡顶超载与地震拟静力荷载
+支持多层地层自重积分、降雨入渗湿润锋、非饱和基质吸力表观黏聚力、
+坡顶超载、地震拟静力荷载、深度效应、空间随机场查表
 """
 import numpy as np
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Callable
 from core.geometry import SlopeGeometry
 from core.materials import SoilMaterial
 from core.slip_surface import BaseSlipSurface, CircularSlipSurface
@@ -47,9 +48,17 @@ def create_slices(
     slip_surface: Optional[BaseSlipSurface] = None,
     tension_crack=None,
     anchors=None,
+    field_lookup: Optional[Callable] = None,   # ★ 新增: (key, x, y) -> float or None
     **kwargs,
 ) -> Tuple[Optional[List[Slice]], Optional[Tuple[float, float, np.ndarray]], str]:
-    """通用边坡切片剖分器（同时支持圆弧与非圆弧折线滑面）"""
+    """通用边坡切片剖分器（同时支持圆弧与非圆弧折线滑面）
+
+    field_lookup 参数:
+      · None → 用材料的均值 / 深度效应算 c、φ
+      · 可调用对象 → 优先从空间场查表, 查不到再退回材料默认逻辑
+        签名: field_lookup(key: str, x: float, y: float) -> Optional[float]
+        key ∈ {"c_dist", "phi_dist", "gamma_dist", ...}
+    """
     if n_slices < 1:
         return None, None, "切片数必须 ≥ 1"
 
@@ -71,6 +80,9 @@ def create_slices(
     x_start, x_end = inter
     if x_end - x_start < 1e-3:
         return None, None, f"滑面水平跨度太小: {x_end - x_start:.4f} m"
+
+    # ★ 坡顶最高点 (用于计算相对深度 z)
+    y_top_global = float(np.max(geom.gy))
 
     x_edges = np.linspace(x_start, x_end, n_slices + 1)
     slices: List[Slice] = []
@@ -103,7 +115,7 @@ def create_slices(
         yw = geom.get_water_elevation(xm)
         wetting_front_y = y_top - max(0.0, float(rainfall_depth))
 
-        # 4. 多层地层自重积分 (★ 关键: 用 get_layer_breakpoints 找分层)
+        # 4. 多层地层自重积分 (用 get_layer_breakpoints 找分层)
         strata_y = geom.get_layer_breakpoints(xm, y_base, y_top)
         div_points = [y_top]
         for sy in strata_y:
@@ -148,14 +160,36 @@ def create_slices(
                              len(materials) - 1)
         base_mat = materials[base_layer_idx]
 
+        # ★ 相对坡顶最高点的深度 (用于深度效应)
+        z_base = max(0.0, y_top_global - y_base)
+
+        # ★ 优先从空间随机场查表
+        c_val = None
+        phi_rad = None
+        if field_lookup is not None:
+            try:
+                c_val = field_lookup("c_dist", xm, y_base)
+                phi_deg_val = field_lookup("phi_dist", xm, y_base)
+                if phi_deg_val is not None:
+                    phi_rad = float(np.radians(phi_deg_val))
+            except Exception:
+                c_val = None
+                phi_rad = None
+
+        # 场查不到 → 退回材料默认逻辑
+        if c_val is None:
+            c_val = base_mat.get_apparent_cohesion(suction, z=z_base)
+        if phi_rad is None:
+            phi_rad = base_mat.get_phi_rad_at_depth(z_base)
+
         s_obj = Slice(
             index=i + 1,
             xm=xm, b=b, h=h, y_top=y_top, y_base=y_base,
             alpha=alpha, l=l,
             W=W_soil, q_load=q_load, kh=kh,
             u=u, suction=suction,
-            c_total=base_mat.get_apparent_cohesion(suction),
-            phi=base_mat.phi,
+            c_total=float(c_val),
+            phi=float(phi_rad),
             layer_name=base_mat.name,
         )
         s_obj.y_cg = 0.5 * (y_top + y_base)

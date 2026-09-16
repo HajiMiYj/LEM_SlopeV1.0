@@ -299,6 +299,33 @@ class MainWindow(QMainWindow):
         short = text.split()[0] if text else "—"
         self.dock_rel.lbl_inherit_model.setText(f"继承自滑面面板: {short}")
 
+    @staticmethod
+    def _make_field_lookup(locked):
+        """把冻结场包装成一个可调用的查表函数"""
+        if not locked or not locked.get("fields"):
+            return None
+
+        xs = locked["xs"]
+        ys = locked["ys"]
+        fields = locked["fields"]
+
+        def _lookup(key, x, y):
+            field = fields.get(key)
+            if field is None:
+                return None
+            # 网格外 → None
+            if x < xs[0] or x > xs[-1] or y < ys[0] or y > ys[-1]:
+                return None
+            # 最近邻插值 (网格 100x60 足够密)
+            ix = int(np.clip(np.searchsorted(xs, x), 0, len(xs) - 1))
+            iy = int(np.clip(np.searchsorted(ys, y), 0, len(ys) - 1))
+            v = field[iy, ix]
+            if not np.isfinite(v):
+                return None
+            return float(v)
+
+        return _lookup
+
     def showEvent(self, event):
         super().showEvent(event)
         if not self._initial_fit_done:
@@ -331,6 +358,10 @@ class MainWindow(QMainWindow):
             surcharge_loads=surcharge,
         )
 
+        # ★ 构造 field_lookup (来自材料面板的冻结场)
+        locked = self.dock_mat.get_locked_field()
+        field_lookup = self._make_field_lookup(locked)
+
         self.current_slices, self.slice_info, msg = create_slices(
             geom=self.current_geom,
             materials=materials,
@@ -338,10 +369,12 @@ class MainWindow(QMainWindow):
             n_slices=n_slices,
             rainfall_depth=rain_depth,
             kh=kh,
+            field_lookup=field_lookup,
         )
 
         ground_x = [p[0] for p in ground_pts]
         ground_y = [p[1] for p in ground_pts]
+        self.dock_mat.set_geometry_context(ground_pts, layer_regions)
 
         # ★ 新增: 把吸附参数传给画布
         self.canvas.set_snap_options(

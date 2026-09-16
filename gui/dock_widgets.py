@@ -14,13 +14,15 @@ from PyQt5.QtWidgets import (
     QLabel, QTableWidget, QTableWidgetItem, QHeaderView, QTabWidget,
     QProgressBar, QTreeWidget, QTreeWidgetItem, QSlider,
     QScrollArea, QFrame, QCheckBox, QMessageBox, QStyledItemDelegate, QLineEdit, QAbstractItemView,
-    QInputDialog
+    QInputDialog, QFileDialog
 )
 
-from core.materials import SoilMaterial
+from core.materials import SoilMaterial, Distribution
 from core.rainfall import RainfallTimeSeries
 from core.slicing import Slice
+from gui.dist_plot import DistributionPlotWidget
 from gui.icons import get_icon
+from gui.spatial_plot import SpatialFieldWidget, points_in_polygon
 
 
 class NumericDelegate(QStyledItemDelegate):
@@ -87,7 +89,7 @@ class GeometryDockWidget(QDockWidget):
         self._suspend_table_signal = False
         self._ground_dirty = False
         self._syncing_selection = False
-        self._bottom_depth = 6.0            # ★ 新增
+        self._bottom_depth = 6.0  # ★ 新增
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setSingleShot(True)
         self._refresh_timer.setInterval(self._REFRESH_DEBOUNCE_MS)
@@ -131,7 +133,6 @@ class GeometryDockWidget(QDockWidget):
         self._ground_dirty = False
         self.geometry_changed.emit()
         self.view_reset_requested.emit()
-
 
     # ==================================================================
     # 细长碎片判定
@@ -468,7 +469,7 @@ class GeometryDockWidget(QDockWidget):
 
         gx = [p[0] for p in self.data_ground]
         gy = [p[1] for p in self.data_ground]
-        bottom = min(gy) - self._bottom_depth       # ★ 用实例属性
+        bottom = min(gy) - self._bottom_depth  # ★ 用实例属性
         x_left, x_right = gx[0], gx[-1]
 
         points = [(x_left, bottom)]
@@ -483,7 +484,7 @@ class GeometryDockWidget(QDockWidget):
     def _build_default_region(self):
         gx = [p[0] for p in self.data_ground]
         gy = [p[1] for p in self.data_ground]
-        bottom = min(gy) - self._bottom_depth       # ★ 用实例属性
+        bottom = min(gy) - self._bottom_depth  # ★ 用实例属性
         x_left, x_right = gx[0], gx[-1]
 
         points = [(x_left, bottom)]
@@ -584,8 +585,6 @@ class GeometryDockWidget(QDockWidget):
                 self.combo_region_pattern.blockSignals(False)
                 self.combo_region_material.blockSignals(False)
                 self.slider_hatch_scale.blockSignals(False)
-
-
 
     def _is_editing_key_consistent(self, item) -> bool:
         if item is None:
@@ -1273,7 +1272,7 @@ class GeometryDockWidget(QDockWidget):
                 self.data_regions[i].get("points", []),
                 self.data_regions[i].get("holes", []))
             if p is None or p.is_empty:
-                self.strata_validation_failed.emit(f"面 #{i+1} 几何无效。")
+                self.strata_validation_failed.emit(f"面 #{i + 1} 几何无效。")
                 return
             polys[i] = p
 
@@ -1300,7 +1299,7 @@ class GeometryDockWidget(QDockWidget):
             )
             return
 
-        names = [self.data_regions[i].get("name", f"土层面 {i+1}") for i in indices]
+        names = [self.data_regions[i].get("name", f"土层面 {i + 1}") for i in indices]
         chosen, ok = QInputDialog.getItem(
             self, "选择主土层",
             "新面将继承哪个面的属性 (材料 / 填充样式 / 名称)?",
@@ -1486,8 +1485,8 @@ class GeometryDockWidget(QDockWidget):
                 pieces = [
                     p for p in self._extract_polygons(combined)
                     if not p.is_empty
-                    and p.area >= 0.01
-                    and not self._is_sliver(p)
+                       and p.area >= 0.01
+                       and not self._is_sliver(p)
                 ]
                 if not pieces:
                     continue
@@ -1684,7 +1683,7 @@ class GeometryDockWidget(QDockWidget):
             "snap_tolerance": self.spin_snap_tol.value(),
             "snap_mode": self.combo_snap_mode.currentData() or "both",
             "hatch_scale": self.slider_hatch_scale.value(),
-            "bottom_depth": self._bottom_depth,     # ★ 新增
+            "bottom_depth": self._bottom_depth,  # ★ 新增
         }
 
     def from_dict(self, data):
@@ -1741,153 +1740,1003 @@ class GeometryDockWidget(QDockWidget):
         self._refresh_region_tree(keep_selection=False)
         self._reset_to_ground_view()
 
-class MaterialDockWidget(QDockWidget):
-    """土层材料库与物理力学参数停靠窗 (动态材料列表)
 
-    设计:
-      · 材料库是一个动态列表, 用户可以增删任意数量
-      · 选中材料 → 下方详情区编辑参数 → 点"应用" 生效
-      · 土层面通过 material_index 引用材料; 改材料参数会影响所有引用它的面
-    """
+class MaterialDockWidget(QDockWidget):
+    """材料库 + 深度效应 + 概率分布 + 空间云图 (联动一致性版本)"""
+
     materials_changed = pyqtSignal()
 
+    _ICON_SIZE = 20
+    _BTN_SIZE = 32
+
+    # (key, 中文名, 单位, 是否非饱和, 是否深度参数, 建议下限, 建议上限)
+    _DIST_ROWS = [
+        ("gamma_dist",           "γ 天然重度",    "kN/m³", False, False, 0, 40),
+        ("gamma_sat_dist",       "γsat 饱和重度",  "kN/m³", False, False, 0, 40),
+        ("c_dist",               "c' 黏聚力",      "kPa",   False, False, 0, 1000),
+        ("phi_dist",             "φ' 摩擦角",      "°",     False, False, 0, 60),
+        ("phi_b_dist",           "φb 吸力摩擦角",  "°",     True,  False, 0, 50),
+        ("suction_cutoff_dist",  "吸力截断",        "kPa",   True,  False, 0, 2000),
+        ("c_depth_rate_dist",    "c 深度增长率",    "kPa/m", False, True,  0, 100),
+        ("phi_depth_rate_dist",  "φ 深度增长率",    "°/m",   False, True,  0, 10),
+    ]
+
+    # ==================================================================
     def __init__(self, parent=None):
         super().__init__("物理力学参数与本构模型", parent)
         self.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+
+        self.current_material_index = 0
+        self._preview_mode = "curve"
+        self._ground_pts = []
+        self._layer_regions = []
+        self._grid_cache_key = None
+        self._grid_cache = None
+        self._last_field = None
+        self._locked_field = None
+
+        self._theta_timer = QTimer(self)
+        self._theta_timer.setSingleShot(True)
+        self._theta_timer.setInterval(200)
+        self._theta_timer.timeout.connect(self._refresh_spatial_view)
+
         self._init_ui()
 
+        self.materials_db = [
+            SoilMaterial("材料 1", 19.0, 21.0, 15.0, 20.0, False, 15.0, 100.0)
+        ]
+        self._refresh_material_table()
+        self._load_material_params(0)
+
+    # ==================================================================
+    def _icon_btn(self, icon_name, tooltip, slot):
+        b = QPushButton()
+        b.setIcon(get_icon(icon_name))
+        b.setIconSize(QSize(self._ICON_SIZE, self._ICON_SIZE))
+        b.setFixedSize(self._BTN_SIZE, self._BTN_SIZE)
+        b.setToolTip(tooltip)
+        b.setCursor(Qt.PointingHandCursor)
+        b.clicked.connect(slot)
+        b.setStyleSheet(
+            "QPushButton{border:1px solid #bdc3c7;border-radius:4px;background:#fdfdfd;}"
+            "QPushButton:hover{background:#ecf0f1;border-color:#3498db;}"
+            "QPushButton:pressed{background:#d5dbdb;}"
+        )
+        return b
+
+    # ==================================================================
     def _init_ui(self):
         container = QWidget()
         layout = QVBoxLayout(container)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
 
-        # ---------- 力学分析工况 ----------
         grp_regime = QGroupBox("力学分析工况与本构模式")
-        form_regime = QFormLayout()
+        f_regime = QFormLayout(grp_regime)
         self.combo_regime = QComboBox()
         self.combo_regime.addItems([
             "常规有效应力模式 (饱和/天然工况)",
-            "非饱和吸力强度模式 (Fredlund 双应力准则)"
+            "非饱和吸力强度模式 (Fredlund 双应力准则)",
         ])
         self.combo_regime.currentIndexChanged.connect(self._on_regime_changed)
-        form_regime.addRow("分析工况:", self.combo_regime)
-        grp_regime.setLayout(form_regime)
+        f_regime.addRow("分析工况:", self.combo_regime)
         layout.addWidget(grp_regime)
 
-        # ---------- 材料库列表 ----------
         grp_list = QGroupBox("材料库")
         v_list = QVBoxLayout(grp_list)
-
         self.tbl_materials = QTableWidget(0, 5)
-        self.tbl_materials.setHorizontalHeaderLabels([
-            "编号", "名称", "γ (kN/m³)", "c' (kPa)", "φ' (°)"
-        ])
+        self.tbl_materials.setHorizontalHeaderLabels(
+            ["编号", "名称", "γ (kN/m³)", "c' (kPa)", "φ' (°)"])
         self.tbl_materials.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.tbl_materials.setSelectionBehavior(QTableWidget.SelectRows)
         self.tbl_materials.setSelectionMode(QTableWidget.SingleSelection)
         self.tbl_materials.setEditTriggers(QTableWidget.NoEditTriggers)
         self.tbl_materials.currentCellChanged.connect(
-            lambda row, *_: self._on_material_selected(row)
-        )
+            lambda row, *_: self._on_material_selected(row))
         v_list.addWidget(self.tbl_materials)
 
-        h_list_btns = QHBoxLayout()
-        btn_add = QPushButton("添加材料")
-        btn_add.setIcon(get_icon("add_item"))
-        btn_add.clicked.connect(self._add_material)
+        h_btns = QHBoxLayout()
+        h_btns.setSpacing(6)
+        h_btns.addWidget(self._icon_btn("material_add", "新增材料", self._add_material))
+        h_btns.addWidget(self._icon_btn("material_copy", "复制当前材料", self._copy_material))
+        h_btns.addWidget(self._icon_btn("material_del", "删除当前材料", self._del_material))
+        h_btns.addStretch()
+        v_list.addLayout(h_btns)
+        layout.addWidget(grp_list, stretch=1)
 
-        btn_copy = QPushButton("复制选中")
-        btn_copy.setIcon(get_icon("add_item"))
-        btn_copy.clicked.connect(self._copy_material)
-
-        btn_del = QPushButton("删除选中")
-        btn_del.setIcon(get_icon("del_item"))
-        btn_del.clicked.connect(self._del_material)
-
-        h_list_btns.addWidget(btn_add)
-        h_list_btns.addWidget(btn_copy)
-        h_list_btns.addWidget(btn_del)
-        v_list.addLayout(h_list_btns)
-
-        grp_list.setLayout(v_list)
-        layout.addWidget(grp_list, stretch=2)
-
-        # ---------- 材料详情 ----------
-        grp_mat = QGroupBox("当前材料参数")
-        form_mat = QFormLayout()
-
+        grp_detail = QGroupBox("当前材料")
+        v_detail = QVBoxLayout(grp_detail)
         self.lbl_current_name = QLabel("—")
         self.lbl_current_name.setStyleSheet("font-weight: bold; color: #2c3e50;")
-        form_mat.addRow("当前材料:", self.lbl_current_name)
+        v_detail.addWidget(self.lbl_current_name)
 
-        self.spin_gamma_dry = QDoubleSpinBox()
-        self.spin_gamma_dry.setRange(5.0, 40.0)
-        self.spin_gamma_dry.setValue(19.0)
-        self.spin_gamma_dry.setSuffix(" kN/m3")
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_tab_basic(), "基本")
+        self.tabs.addTab(self._build_tab_depth(), "深度效应")
+        self.tabs.addTab(self._build_tab_dist(), "概率分布")
+        self.tabs.addTab(self._build_tab_preview(), "预览")
+        v_detail.addWidget(self.tabs)
 
-        self.spin_gamma_sat = QDoubleSpinBox()
-        self.spin_gamma_sat.setRange(5.0, 40.0)
-        self.spin_gamma_sat.setValue(21.0)
-        self.spin_gamma_sat.setSuffix(" kN/m3")
+        h_apply = QHBoxLayout()
+        h_apply.addStretch()
+        h_apply.addWidget(self._icon_btn(
+            "apply_surface", "应用当前材料参数", self._apply_current_material))
+        v_detail.addLayout(h_apply)
+        layout.addWidget(grp_detail, stretch=3)
 
-        self.spin_c = QDoubleSpinBox()
-        self.spin_c.setRange(0.0, 500.0)
-        self.spin_c.setValue(15.0)
-        self.spin_c.setSuffix(" kPa")
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidget(container)
+        self.setWidget(scroll)
 
-        self.spin_phi = QDoubleSpinBox()
-        self.spin_phi.setRange(0.0, 55.0)
-        self.spin_phi.setValue(20.0)
-        self.spin_phi.setSuffix(" °")
+    # ------------------------------------------------------------------
+    # Tab 1: 基本
+    # ------------------------------------------------------------------
+    def _build_tab_basic(self):
+        w = QWidget()
+        f = QFormLayout(w)
 
-        form_mat.addRow("天然重度 (γ):", self.spin_gamma_dry)
-        form_mat.addRow("饱和重度 (γsat):", self.spin_gamma_sat)
-        form_mat.addRow("有效黏聚力 (c'):", self.spin_c)
-        form_mat.addRow("有效摩擦角 (φ'):", self.spin_phi)
+        def mk_spin(lo, hi, val, step, suffix, decimals=2):
+            s = QDoubleSpinBox()
+            s.setRange(lo, hi)
+            s.setValue(val)
+            s.setSingleStep(step)
+            s.setDecimals(decimals)
+            s.setSuffix(suffix)
+            return s
 
-        self.grp_unsat = QGroupBox("非饱和基质吸力强度参数")
-        form_unsat = QFormLayout()
-        self.spin_phib = QDoubleSpinBox()
-        self.spin_phib.setRange(0.0, 50.0)
-        self.spin_phib.setValue(15.0)
-        self.spin_phib.setSuffix(" °")
-        self.spin_cutoff = QDoubleSpinBox()
-        self.spin_cutoff.setRange(0.0, 1000.0)
-        self.spin_cutoff.setValue(100.0)
-        self.spin_cutoff.setSuffix(" kPa")
-        form_unsat.addRow("吸力摩擦角 (φb):", self.spin_phib)
-        form_unsat.addRow("吸力截断上限值:", self.spin_cutoff)
-        self.grp_unsat.setLayout(form_unsat)
+        self.spin_gamma_dry = mk_spin(5, 40, 19.0, 0.1, " kN/m³")
+        self.spin_gamma_sat = mk_spin(5, 40, 21.0, 0.1, " kN/m³")
+        self.spin_c = mk_spin(0, 500, 15.0, 1.0, " kPa")
+        self.spin_phi = mk_spin(0, 55, 20.0, 0.5, " °")
+        self.spin_phib = mk_spin(0, 50, 15.0, 0.5, " °")
+        self.spin_cutoff = mk_spin(0, 1000, 100.0, 5.0, " kPa")
+
+        f.addRow("天然重度 (γ):", self.spin_gamma_dry)
+        f.addRow("饱和重度 (γsat):", self.spin_gamma_sat)
+        f.addRow("有效黏聚力 (c'):", self.spin_c)
+        f.addRow("有效摩擦角 (φ'):", self.spin_phi)
+
+        self.grp_unsat = QGroupBox("非饱和基质吸力参数")
+        fu = QFormLayout(self.grp_unsat)
+        fu.addRow("吸力摩擦角 (φb):", self.spin_phib)
+        fu.addRow("吸力截断上限:", self.spin_cutoff)
+        f.addRow(self.grp_unsat)
         self.grp_unsat.setEnabled(False)
-        form_mat.addRow(self.grp_unsat)
 
-        btn_apply = QPushButton("应用当前材料参数")
-        btn_apply.setIcon(get_icon("apply_surface"))
-        btn_apply.setStyleSheet(
-            "background-color: #27ae60; color: white; "
-            "font-weight: bold; padding: 6px;"
-        )
-        btn_apply.clicked.connect(self._apply_current_material)
-        form_mat.addRow(btn_apply)
+        # 基本 tab 数值变化 → 同步到分布表
+        for spin, key in ((self.spin_gamma_dry, "gamma_dist"),
+                          (self.spin_gamma_sat, "gamma_sat_dist"),
+                          (self.spin_c, "c_dist"),
+                          (self.spin_phi, "phi_dist"),
+                          (self.spin_phib, "phi_b_dist"),
+                          (self.spin_cutoff, "suction_cutoff_dist")):
+            spin.valueChanged.connect(
+                lambda _v, k=key: self._sync_basic_to_dist(k))
+        return w
 
-        grp_mat.setLayout(form_mat)
-        layout.addWidget(grp_mat, stretch=2)
+    # ------------------------------------------------------------------
+    # Tab 2: 深度效应
+    # ------------------------------------------------------------------
+    def _build_tab_depth(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
 
-        layout.addStretch()
-        self.setWidget(container)
+        self.chk_use_depth = QCheckBox("启用深度效应 (c, φ 随深度线性增长)")
+        v.addWidget(self.chk_use_depth)
 
-        # ---------- 默认材料库: 一个材料 ----------
-        self.materials_db = [
-            SoilMaterial("材料 1", 19.0, 21.0, 15.0, 20.0, False, 15.0, 100.0),
-        ]
-        self.current_material_index = 0
-        self._refresh_material_table()
-        self._load_material_params(0)
+        f = QFormLayout()
+        self.spin_c_rate = QDoubleSpinBox()
+        self.spin_c_rate.setRange(0.0, 50.0)
+        self.spin_c_rate.setValue(0.0)
+        self.spin_c_rate.setSingleStep(0.5)
+        self.spin_c_rate.setSuffix(" kPa/m")
+
+        self.spin_phi_rate = QDoubleSpinBox()
+        self.spin_phi_rate.setRange(0.0, 5.0)
+        self.spin_phi_rate.setValue(0.0)
+        self.spin_phi_rate.setSingleStep(0.1)
+        self.spin_phi_rate.setSuffix(" °/m")
+
+        self.spin_depth_ref = QDoubleSpinBox()
+        self.spin_depth_ref.setRange(-100.0, 200.0)
+        self.spin_depth_ref.setValue(0.0)
+        self.spin_depth_ref.setSingleStep(0.5)
+        self.spin_depth_ref.setSuffix(" m")
+
+        f.addRow("c' 随深度增长率:", self.spin_c_rate)
+        f.addRow("φ' 随深度增长率:", self.spin_phi_rate)
+        f.addRow("参考深度 (相对坡顶):", self.spin_depth_ref)
+        v.addLayout(f)
+
+        v.addWidget(QLabel("<b>深度剖面预览:</b>"))
+        self.tbl_profile = QTableWidget(0, 3)
+        self.tbl_profile.setHorizontalHeaderLabels(
+            ["深度 z (m)", "c' (kPa)", "φ' (°)"])
+        self.tbl_profile.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.tbl_profile.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.tbl_profile.setMaximumHeight(180)
+        v.addWidget(self.tbl_profile)
+        v.addStretch()
+
+        self._depth_widgets = [self.spin_c_rate, self.spin_phi_rate,
+                               self.spin_depth_ref]
+        for x in self._depth_widgets:
+            x.setEnabled(False)
+
+        self.chk_use_depth.stateChanged.connect(self._on_depth_toggle)
+        for s in (self.spin_c_rate, self.spin_phi_rate, self.spin_depth_ref):
+            s.valueChanged.connect(self._refresh_depth_profile)
+        return w
+
+    def _on_depth_toggle(self, _=None):
+        on = self.chk_use_depth.isChecked()
+        for x in self._depth_widgets:
+            x.setEnabled(on)
+        self._refresh_depth_profile()
+
+    def _refresh_depth_profile(self, *_):
+        self.tbl_profile.setRowCount(0)
+        use = self.chk_use_depth.isChecked()
+        c0 = self.spin_c.value()
+        phi0 = self.spin_phi.value()
+        c_rate = self.spin_c_rate.value()
+        phi_rate = self.spin_phi_rate.value()
+        z_ref = self.spin_depth_ref.value()
+
+        z_list = [0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 15.0, 20.0]
+        self.tbl_profile.setRowCount(len(z_list))
+        for r, z in enumerate(z_list):
+            if use:
+                de = max(0.0, z - z_ref)
+                c_val = c0 + c_rate * de
+                phi_val = phi0 + phi_rate * de
+            else:
+                c_val = c0
+                phi_val = phi0
+            self.tbl_profile.setItem(r, 0, QTableWidgetItem(f"{z:.2f}"))
+            self.tbl_profile.setItem(r, 1, QTableWidgetItem(f"{c_val:.2f}"))
+            self.tbl_profile.setItem(r, 2, QTableWidgetItem(f"{phi_val:.2f}"))
+
+    # ------------------------------------------------------------------
+    # Tab 3: 概率分布 (7 列: 参数|单位|分布类型|均值|COV|下限|上限)
+    # ------------------------------------------------------------------
+    def _build_tab_dist(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+
+        self.chk_use_random = QCheckBox("启用概率分布 (供可靠度分析抽样)")
+        v.addWidget(self.chk_use_random)
+
+        self.tbl_dist = QTableWidget(len(self._DIST_ROWS), 7)
+        self.tbl_dist.setHorizontalHeaderLabels(
+            ["参数", "单位", "分布类型", "均值", "COV", "下限", "上限"])
+        hh = self.tbl_dist.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        for c in (2, 3, 4, 5, 6):
+            hh.setSectionResizeMode(c, QHeaderView.Stretch)
+        self.tbl_dist.verticalHeader().setVisible(False)
+        self.tbl_dist.setMinimumHeight(280)
+        v.addWidget(self.tbl_dist)
+
+        self._dist_widgets = {}
+
+        for r, (key, name, unit, is_unsat, is_depth, lo, hi) in \
+                enumerate(self._DIST_ROWS):
+            self.tbl_dist.setItem(r, 0, QTableWidgetItem(name))
+            self.tbl_dist.setItem(r, 1, QTableWidgetItem(unit))
+
+            combo = QComboBox()
+            for k, lbl in Distribution.KIND_LABELS.items():
+                combo.addItem(lbl, k)
+            self.tbl_dist.setCellWidget(r, 2, combo)
+
+            spin_mean = QDoubleSpinBox()
+            spin_mean.setRange(-1e6, 1e6)
+            spin_mean.setDecimals(3)
+            spin_mean.setSingleStep(0.5)
+            self.tbl_dist.setCellWidget(r, 3, spin_mean)
+
+            spin_cov = QDoubleSpinBox()
+            spin_cov.setRange(0.0, 1.0)
+            spin_cov.setDecimals(3)
+            spin_cov.setSingleStep(0.01)
+            self.tbl_dist.setCellWidget(r, 4, spin_cov)
+
+            spin_lo = QDoubleSpinBox()
+            spin_lo.setRange(-1e6, 1e6)
+            spin_lo.setDecimals(3)
+            spin_lo.setSingleStep(0.5)
+            spin_lo.setValue(float(lo))
+            self.tbl_dist.setCellWidget(r, 5, spin_lo)
+
+            spin_hi = QDoubleSpinBox()
+            spin_hi.setRange(-1e6, 1e6)
+            spin_hi.setDecimals(3)
+            spin_hi.setSingleStep(0.5)
+            spin_hi.setValue(float(hi))
+            self.tbl_dist.setCellWidget(r, 6, spin_hi)
+
+            self._dist_widgets[key] = {
+                "row": r, "combo": combo, "mean": spin_mean,
+                "cov": spin_cov, "lo": spin_lo, "hi": spin_hi,
+            }
+
+            combo.currentIndexChanged.connect(
+                lambda _i, k=key: self._on_dist_kind_changed(k))
+            spin_mean.valueChanged.connect(
+                lambda _v, k=key: self._on_dist_mean_changed(k))
+            spin_cov.valueChanged.connect(
+                lambda _v, k=key: self._on_dist_value_changed(k, "cov"))
+            spin_lo.valueChanged.connect(
+                lambda _v, k=key: self._on_dist_value_changed(k, "lo"))
+            spin_hi.valueChanged.connect(
+                lambda _v, k=key: self._on_dist_value_changed(k, "hi"))
+
+        v.addStretch()
+        self.tbl_dist.setEnabled(False)
+        self.chk_use_random.stateChanged.connect(self._on_random_toggle)
+        return w
 
     # ==================================================================
-    # 材料列表操作
+    # 分布表联动
+    # ==================================================================
+    @staticmethod
+    def _set_spin(spin, value):
+        spin.blockSignals(True)
+        spin.setValue(value)
+        spin.blockSignals(False)
+
+    def _update_dist_row_enabled(self, key, kind):
+        """按分布类型启用/禁用各列"""
+        wdg = self._dist_widgets.get(key)
+        if wdg is None:
+            return
+        if kind == Distribution.DET:
+            wdg["mean"].setEnabled(True)
+            wdg["cov"].setEnabled(False)
+            wdg["lo"].setEnabled(False)
+            wdg["hi"].setEnabled(False)
+        elif kind in (Distribution.NORMAL, Distribution.LOGNORMAL):
+            wdg["mean"].setEnabled(True)
+            wdg["cov"].setEnabled(True)
+            wdg["lo"].setEnabled(False)
+            wdg["hi"].setEnabled(False)
+        elif kind == Distribution.TRUNC_NORMAL:
+            wdg["mean"].setEnabled(True)
+            wdg["cov"].setEnabled(True)
+            wdg["lo"].setEnabled(True)
+            wdg["hi"].setEnabled(True)
+        elif kind == Distribution.UNIFORM:
+            wdg["mean"].setEnabled(False)
+            wdg["cov"].setEnabled(False)
+            wdg["lo"].setEnabled(True)
+            wdg["hi"].setEnabled(True)
+
+    def _on_random_toggle(self, _=None):
+        """概率分布总开关"""
+        on = self.chk_use_random.isChecked()
+
+        # 分布表 enable/disable
+        self.tbl_dist.setEnabled(on)
+
+        # 写回当前材料的开关 (不改变内部参数)
+        idx = self.current_material_index
+        if 0 <= idx < len(self.materials_db):
+            self.materials_db[idx].use_random_dist = on
+
+        # 刷新预览
+        self._refresh_preview_tab()
+        if self._preview_mode == "field":
+            self._refresh_spatial_view()
+
+    def _on_dist_kind_changed(self, key):
+        idx = self.current_material_index
+        if not (0 <= idx < len(self.materials_db)):
+            return
+        m = self.materials_db[idx]
+        d = getattr(m, key, None)
+        if not isinstance(d, Distribution):
+            return
+        wdg = self._dist_widgets.get(key)
+        if wdg is None:
+            return
+
+        kind = wdg["combo"].currentData()
+        d.kind = kind
+
+        if kind == Distribution.DET:
+            # 固定值: 上下限归零到 mean, COV 归零
+            self._set_spin(wdg["cov"], 0.0)
+            self._set_spin(wdg["lo"], d.mean)
+            self._set_spin(wdg["hi"], d.mean)
+            d.cov = 0.0
+            d.lower = d.mean
+            d.upper = d.mean
+
+        elif kind in (Distribution.NORMAL, Distribution.LOGNORMAL):
+            # 正态/对数正态: 上下限无效, 用 None
+            d.lower = None
+            d.upper = None
+
+        elif kind == Distribution.TRUNC_NORMAL:
+            # 截断正态: 保持 mean ∈ [lo, hi]
+            lo = wdg["lo"].value()
+            hi = wdg["hi"].value()
+            if hi <= lo:
+                hi = lo + 1.0
+                self._set_spin(wdg["hi"], hi)
+            if d.mean < lo:
+                self._set_spin(wdg["mean"], lo)
+                self._sync_dist_to_basic(key, lo)
+                d.mean = lo
+            if d.mean > hi:
+                self._set_spin(wdg["mean"], hi)
+                self._sync_dist_to_basic(key, hi)
+                d.mean = hi
+            d.lower = lo
+            d.upper = hi
+
+        elif kind == Distribution.UNIFORM:
+            # 均匀: 均值自动 = (lo + hi) / 2
+            lo = wdg["lo"].value()
+            hi = wdg["hi"].value()
+            if hi <= lo:
+                hi = lo + 1.0
+                self._set_spin(wdg["hi"], hi)
+            mid = 0.5 * (lo + hi)
+            self._set_spin(wdg["mean"], mid)
+            self._sync_dist_to_basic(key, mid)
+            d.mean = mid
+            d.lower = lo
+            d.upper = hi
+            if mid > 1e-9:
+                auto_cov = (hi - lo) / (2 * np.sqrt(3) * mid)
+            else:
+                auto_cov = 0.0
+            self._set_spin(wdg["cov"], auto_cov)
+            d.cov = auto_cov
+
+        self._update_dist_row_enabled(key, kind)
+        self._refresh_preview_tab()
+        if self._preview_mode == "field":
+            self._refresh_spatial_view()
+
+    def _on_dist_mean_changed(self, key):
+        idx = self.current_material_index
+        if not (0 <= idx < len(self.materials_db)):
+            return
+        m = self.materials_db[idx]
+        d = getattr(m, key, None)
+        if not isinstance(d, Distribution):
+            return
+        wdg = self._dist_widgets.get(key)
+        if wdg is None:
+            return
+
+        v = wdg["mean"].value()
+        d.mean = v
+
+        # 截断正态: 保持 mean ∈ [lo, hi]
+        if d.kind == Distribution.TRUNC_NORMAL:
+            lo = wdg["lo"].value()
+            hi = wdg["hi"].value()
+            if v < lo:
+                self._set_spin(wdg["lo"], v)
+                d.lower = v
+            if v > hi:
+                self._set_spin(wdg["hi"], v)
+                d.upper = v
+
+        # 均匀: 不允许改均值 (已被禁用), 但若信号仍到达, 忽略改动
+        if d.kind == Distribution.UNIFORM:
+            return
+
+        self._sync_dist_to_basic(key, v)
+        self._refresh_preview_tab()
+        if self._preview_mode == "field":
+            self._refresh_spatial_view()
+
+    def _on_dist_value_changed(self, key, field):
+        idx = self.current_material_index
+        if not (0 <= idx < len(self.materials_db)):
+            return
+        m = self.materials_db[idx]
+        d = getattr(m, key, None)
+        if not isinstance(d, Distribution):
+            return
+        wdg = self._dist_widgets.get(key)
+        if wdg is None:
+            return
+
+        lo = wdg["lo"].value()
+        hi = wdg["hi"].value()
+        mean = wdg["mean"].value()
+
+        # 上下限顺序
+        if hi < lo:
+            if field == "lo":
+                hi = lo
+                self._set_spin(wdg["hi"], hi)
+            else:
+                lo = hi
+                self._set_spin(wdg["lo"], lo)
+
+        # 均值必须 ∈ [lo, hi]
+        if mean < lo:
+            if field == "lo":
+                self._set_spin(wdg["mean"], lo)
+                d.mean = lo
+                mean = lo
+                self._sync_dist_to_basic(key, lo)
+            else:
+                self._set_spin(wdg["lo"], mean)
+                lo = mean
+        if mean > hi:
+            if field == "hi":
+                self._set_spin(wdg["mean"], hi)
+                d.mean = hi
+                mean = hi
+                self._sync_dist_to_basic(key, hi)
+            else:
+                self._set_spin(wdg["hi"], mean)
+                hi = mean
+
+        d.lower = lo
+        d.upper = hi
+        if field == "cov":
+            d.cov = wdg["cov"].value()
+
+        # 均匀分布: 均值 = (lo + hi) / 2, COV 自动
+        if d.kind == Distribution.UNIFORM:
+            mid = 0.5 * (lo + hi)
+            self._set_spin(wdg["mean"], mid)
+            d.mean = mid
+            self._sync_dist_to_basic(key, mid)
+            if mid > 1e-9:
+                d.cov = (hi - lo) / (2 * np.sqrt(3) * mid)
+            else:
+                d.cov = 0.0
+            self._set_spin(wdg["cov"], d.cov)
+
+        self._refresh_preview_tab()
+        if self._preview_mode == "field":
+            self._refresh_spatial_view()
+
+    def _sync_dist_to_basic(self, key, value):
+        """分布表的均值变化 → 同步到基本 tab"""
+        mapping = {
+            "gamma_dist": self.spin_gamma_dry,
+            "gamma_sat_dist": self.spin_gamma_sat,
+            "c_dist": self.spin_c,
+            "phi_dist": self.spin_phi,
+            "phi_b_dist": self.spin_phib,
+            "suction_cutoff_dist": self.spin_cutoff,
+        }
+        spin = mapping.get(key)
+        if spin is None:
+            return
+        spin.blockSignals(True)
+        spin.setValue(value)
+        spin.blockSignals(False)
+
+    def _sync_basic_to_dist(self, key):
+        """基本 tab 数值变化 → 分布表均值同步"""
+        mapping = {
+            "gamma_dist": self.spin_gamma_dry,
+            "gamma_sat_dist": self.spin_gamma_sat,
+            "c_dist": self.spin_c,
+            "phi_dist": self.spin_phi,
+            "phi_b_dist": self.spin_phib,
+            "suction_cutoff_dist": self.spin_cutoff,
+        }
+        spin = mapping.get(key)
+        if spin is None:
+            return
+        wdg = self._dist_widgets.get(key)
+        if wdg is None:
+            return
+        v = spin.value()
+        self._set_spin(wdg["mean"], v)
+
+        # 联动: 若均值越界, 拉回边界
+        lo = wdg["lo"].value()
+        hi = wdg["hi"].value()
+        if v < lo:
+            self._set_spin(wdg["lo"], v)
+        if v > hi:
+            self._set_spin(wdg["hi"], v)
+
+        # 写入 Distribution
+        idx = self.current_material_index
+        if 0 <= idx < len(self.materials_db):
+            d = getattr(self.materials_db[idx], key, None)
+            if isinstance(d, Distribution):
+                d.mean = v
+                d.lower = wdg["lo"].value()
+                d.upper = wdg["hi"].value()
+
+    # ==================================================================
+    # Tab 4: 预览
+    # ==================================================================
+    def _build_tab_preview(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+
+        h_top = QHBoxLayout()
+        h_top.addWidget(QLabel("视图:"))
+        self.btn_view_curve = QPushButton("分布曲线")
+        self.btn_view_curve.setCheckable(True)
+        self.btn_view_curve.setChecked(True)
+        self.btn_view_curve.clicked.connect(
+            lambda: self._switch_preview_view("curve"))
+        self.btn_view_field = QPushButton("空间云图")
+        self.btn_view_field.setCheckable(True)
+        self.btn_view_field.clicked.connect(
+            lambda: self._switch_preview_view("field"))
+        h_top.addWidget(self.btn_view_curve)
+        h_top.addWidget(self.btn_view_field)
+        h_top.addStretch()
+        h_top.addWidget(self._icon_btn("apply_surface", "冻结当前实现", self._freeze_field))
+        h_top.addWidget(self._icon_btn("dist_export", "导出为 PNG", self._export_preview))
+        v.addLayout(h_top)
+
+        self.w_curve_ctrl = QWidget()
+        h_curve = QHBoxLayout(self.w_curve_ctrl)
+        h_curve.setContentsMargins(0, 0, 0, 0)
+        h_curve.addWidget(QLabel("参数:"))
+        self.combo_preview = QComboBox()
+        for key, name, unit, *_ in self._DIST_ROWS:
+            self.combo_preview.addItem(f"{name}  [{unit}]", (key, unit))
+        self.combo_preview.currentIndexChanged.connect(
+            lambda _: self._refresh_preview_tab())
+        h_curve.addWidget(self.combo_preview, 1)
+        v.addWidget(self.w_curve_ctrl)
+
+        self.w_field_ctrl = QWidget()
+        h_field = QHBoxLayout(self.w_field_ctrl)
+        h_field.setContentsMargins(0, 0, 0, 0)
+        h_field.addWidget(QLabel("参数:"))
+        self.combo_field_param = QComboBox()
+        for key, name, unit, *_ in self._DIST_ROWS:
+            self.combo_field_param.addItem(f"{name}  [{unit}]", (key, unit))
+        self.combo_field_param.currentIndexChanged.connect(
+            lambda _: self._refresh_spatial_view())
+        h_field.addWidget(self.combo_field_param, 1)
+        h_field.addWidget(QLabel("模式:"))
+        self.combo_field_mode = QComboBox()
+        self.combo_field_mode.addItem("均值", "mean")
+        self.combo_field_mode.addItem("单次随机实现", "sample")
+        self.combo_field_mode.currentIndexChanged.connect(
+            lambda _: self._refresh_spatial_view())
+        h_field.addWidget(self.combo_field_mode)
+        h_field.addWidget(QLabel("θx:"))
+        self.spin_theta_x = QDoubleSpinBox()
+        self.spin_theta_x.setRange(0.5, 100.0)
+        self.spin_theta_x.setValue(5.0)
+        self.spin_theta_x.setSuffix(" m")
+        self.spin_theta_x.valueChanged.connect(self._on_theta_changed_debounced)
+        h_field.addWidget(self.spin_theta_x)
+        h_field.addWidget(QLabel("θy:"))
+        self.spin_theta_y = QDoubleSpinBox()
+        self.spin_theta_y.setRange(0.5, 100.0)
+        self.spin_theta_y.setValue(2.0)
+        self.spin_theta_y.setSuffix(" m")
+        self.spin_theta_y.valueChanged.connect(self._on_theta_changed_debounced)
+        h_field.addWidget(self.spin_theta_y)
+        h_field.addWidget(QLabel("种子:"))
+        self.spin_field_seed = QSpinBox()
+        self.spin_field_seed.setRange(0, 2_000_000_000)
+        self.spin_field_seed.setValue(42)
+        self.spin_field_seed.valueChanged.connect(
+            lambda _: self._refresh_spatial_view())
+        h_field.addWidget(self.spin_field_seed)
+        v.addWidget(self.w_field_ctrl)
+
+        self.dist_plot = DistributionPlotWidget()
+        v.addWidget(self.dist_plot, stretch=1)
+        self.spatial_plot = SpatialFieldWidget()
+        self.spatial_plot.setVisible(False)
+        v.addWidget(self.spatial_plot, stretch=1)
+
+        self.w_field_ctrl.setVisible(False)
+        return w
+
+    def _switch_preview_view(self, mode):
+        self._preview_mode = mode
+        self.btn_view_curve.setChecked(mode == "curve")
+        self.btn_view_field.setChecked(mode == "field")
+        self.w_curve_ctrl.setVisible(mode == "curve")
+        self.w_field_ctrl.setVisible(mode == "field")
+        self.dist_plot.setVisible(mode == "curve")
+        self.spatial_plot.setVisible(mode == "field")
+        if mode == "curve":
+            self._refresh_preview_tab()
+        else:
+            self._refresh_spatial_view()
+
+    def _refresh_preview_tab(self):
+        if self._preview_mode != "curve":
+            return
+        idx = self.current_material_index
+        if not (0 <= idx < len(self.materials_db)):
+            self.dist_plot.clear("无材料")
+            return
+        m = self.materials_db[idx]
+        if not m.use_random_dist:
+            self.dist_plot.clear("未启用概率分布 (请在上方勾选)")
+            return
+        key, unit = self.combo_preview.currentData()
+        d = getattr(m, key, None)
+        if not isinstance(d, Distribution):
+            self.dist_plot.clear("分布对象缺失")
+            return
+        name = self.combo_preview.currentText().split("  [")[0]
+        self.dist_plot.set_distribution(d, name, unit)
+
+    def _export_preview(self):
+        if self._preview_mode == "curve":
+            self._export_dist_plot()
+        else:
+            self._export_spatial_plot()
+
+    def _export_dist_plot(self):
+        if self.dist_plot._dist is None:
+            QMessageBox.information(self, "导出", "当前无可导出的分布曲线。")
+            return
+        name = self.combo_preview.currentText().split("  [")[0]
+        fpath, _ = QFileDialog.getSaveFileName(
+            self, "导出分布图", f"dist_{name}.png",
+            "PNG 图片 (*.png);;所有文件 (*.*)")
+        if not fpath:
+            return
+        if not fpath.lower().endswith(".png"):
+            fpath += ".png"
+        if self.dist_plot.export_png(fpath):
+            QMessageBox.information(self, "导出成功", f"分布图已保存至:\n{fpath}")
+        else:
+            QMessageBox.warning(self, "导出失败", "写入图片失败。")
+
+    def _export_spatial_plot(self):
+        try:
+            pix = self.spatial_plot.grab()
+        except Exception:
+            QMessageBox.warning(self, "导出失败", "无法截取云图。")
+            return
+        fpath, _ = QFileDialog.getSaveFileName(
+            self, "导出云图", "spatial_field.png",
+            "PNG 图片 (*.png);;所有文件 (*.*)")
+        if not fpath:
+            return
+        if not fpath.lower().endswith(".png"):
+            fpath += ".png"
+        if pix.save(fpath, "PNG"):
+            QMessageBox.information(self, "导出成功", f"云图已保存至:\n{fpath}")
+        else:
+            QMessageBox.warning(self, "导出失败", "写入图片失败。")
+
+    # ==================================================================
+    # 空间云图
+    # ==================================================================
+    def set_geometry_context(self, ground_pts, layer_regions):
+        self._ground_pts = list(ground_pts or [])
+        self._layer_regions = list(layer_regions or [])
+        self._grid_cache_key = None
+        self._grid_cache = None
+        if self._preview_mode == "field":
+            self._refresh_spatial_view()
+
+    def _on_theta_changed_debounced(self, _):
+        self._theta_timer.start()
+
+    def _build_region_masks(self, xs, ys, XX, YY):
+        def _in_poly(xx, yy, poly):
+            n = len(poly)
+            if n < 3:
+                return np.zeros_like(xx, dtype=bool)
+            inside = np.zeros(xx.shape, dtype=bool)
+            j = n - 1
+            for i in range(n):
+                xi, yi = poly[i]
+                xj, yj = poly[j]
+                cond = (yi > yy) != (yj > yy)
+                denom = yj - yi
+                denom = np.where(np.abs(denom) < 1e-20, 1e-20, denom)
+                x_cross = (xj - xi) * (yy - yi) / denom + xi
+                inside ^= (cond & (xx < x_cross))
+                j = i
+            return inside
+
+        masks = []
+        XX_flat = XX.ravel()
+        YY_flat = YY.ravel()
+        for r in self._layer_regions:
+            pts = r.get("points", [])
+            if len(pts) < 3:
+                masks.append(None)
+                continue
+            arr = np.asarray(pts, dtype=float)
+            bx0, bx1 = arr[:, 0].min(), arr[:, 0].max()
+            by0, by1 = arr[:, 1].min(), arr[:, 1].max()
+            cand = ((XX_flat >= bx0) & (XX_flat <= bx1)
+                    & (YY_flat >= by0) & (YY_flat <= by1))
+            mask_flat = np.zeros_like(XX_flat, dtype=bool)
+            if cand.any():
+                inside_sub = _in_poly(XX_flat[cand], YY_flat[cand],
+                                      [tuple(p) for p in arr])
+                idx_cand = np.where(cand)[0]
+                mask_flat[idx_cand[inside_sub]] = True
+            masks.append(mask_flat.reshape(XX.shape))
+        return masks
+
+    @staticmethod
+    def _effective_dist_stats(d):
+        """从分布抽样估计"实际生效"的 mean / std / lo / hi"""
+        if d.kind == d.DET or d.cov <= 0.0:
+            m = float(d.mean)
+            return m, 0.0, m, m
+        sample = d.sample(100000)
+        eff_mean = float(sample.mean())
+        eff_std = float(sample.std())
+        lo = float(d.lower) if d.lower is not None else float(sample.min())
+        hi = float(d.upper) if d.upper is not None else float(sample.max())
+        return eff_mean, eff_std, lo, hi
+
+    def _refresh_spatial_view(self):
+        if self._preview_mode != "field":
+            return
+        if not self._ground_pts or not self._layer_regions:
+            self.spatial_plot.clear("未设置几何模型")
+            return
+        if not self.materials_db:
+            self.spatial_plot.clear("无材料")
+            return
+
+        key, unit = self.combo_field_param.currentData()
+        param_name = self.combo_field_param.currentText().split("  [")[0]
+        mode = self.combo_field_mode.currentData()
+
+        gx = [p[0] for p in self._ground_pts]
+        gy = [p[1] for p in self._ground_pts]
+        x_min, x_max = min(gx), max(gx)
+        y_min, y_max = min(gy) - 8.0, max(gy) + 1.0
+        nx, ny = 100, 60
+
+        cache_key = (round(x_min, 4), round(x_max, 4),
+                     round(y_min, 4), round(y_max, 4),
+                     nx, ny, len(self._layer_regions))
+        if self._grid_cache_key != cache_key:
+            xs = np.linspace(x_min, x_max, nx)
+            ys = np.linspace(y_min, y_max, ny)
+            XX, YY = np.meshgrid(xs, ys)
+            region_masks = self._build_region_masks(xs, ys, XX, YY)
+            self._grid_cache = (xs, ys, XX, YY, region_masks)
+            self._grid_cache_key = cache_key
+        else:
+            xs, ys, XX, YY, region_masks = self._grid_cache
+
+        field = np.full_like(XX, np.nan, dtype=float)
+        seed = int(self.spin_field_seed.value())
+        theta_x = float(self.spin_theta_x.value())
+        theta_y = float(self.spin_theta_y.value())
+
+        for r_idx, mask in enumerate(region_masks):
+            if mask is None or not mask.any():
+                continue
+            r = self._layer_regions[r_idx]
+            mat_idx = int(r.get("material_index", 0))
+            if not (0 <= mat_idx < len(self.materials_db)):
+                continue
+            mat = self.materials_db[mat_idx]
+            d = getattr(mat, key, None)
+            if not isinstance(d, Distribution):
+                continue
+
+            eff_mean, eff_std, eff_lo, eff_hi = self._effective_dist_stats(d)
+
+            if mode == "mean":
+                if mat.use_depth_effect and key in ("c_dist", "phi_dist"):
+                    y_top = max(gy)
+                    Z = np.maximum(0.0, y_top - YY - mat.depth_ref)
+                    if key == "c_dist":
+                        field_r = mat.c_prime + mat.c_depth_rate * Z
+                    else:
+                        field_r = mat.phi_deg + mat.phi_depth_rate * Z
+                else:
+                    field_r = np.full_like(XX, eff_mean)
+            else:
+                if eff_std > 1e-12:
+                    try:
+                        from core.random_field import generate_field_on_grid
+                    except ImportError:
+                        continue
+                    region_seed = int(seed) * 10007 + r_idx * 7919
+                    field_r = generate_field_on_grid(
+                        xs, ys, theta_x=theta_x, theta_y=theta_y,
+                        mean=eff_mean, std=eff_std, seed=region_seed)
+                    field_r = np.clip(field_r, eff_lo, eff_hi)
+                else:
+                    field_r = np.full_like(XX, eff_mean)
+
+            field[mask] = field_r[mask]
+
+        self._last_field = {
+            "field": field.copy(), "xs": xs.copy(), "ys": ys.copy(),
+            "key": key, "mode": mode, "seed": seed,
+            "theta_x": theta_x, "theta_y": theta_y,
+        }
+        self.spatial_plot.set_data(
+            self._ground_pts, self._layer_regions,
+            field, xs, ys, title=param_name, unit=unit)
+
+    def _freeze_field(self):
+        if self._last_field is None:
+            QMessageBox.information(self, "冻结", "请先生成云图。")
+            return
+        lf = self._last_field
+        if lf["mode"] != "sample":
+            QMessageBox.information(
+                self, "冻结",
+                "当前是'均值'模式, 请切到'单次随机实现'后再冻结。")
+            return
+        self._locked_field = {
+            "xs": lf["xs"].copy(),
+            "ys": lf["ys"].copy(),
+            "seed": lf["seed"],
+            "theta_x": lf["theta_x"],
+            "theta_y": lf["theta_y"],
+            "fields": {},
+        }
+        for key, *_ in self._DIST_ROWS:
+            self._locked_field["fields"][key] = self._compute_field_for_key(key)
+        QMessageBox.information(
+            self, "冻结完成",
+            f"已冻结当前实现 (种子={lf['seed']})。\n"
+            "后续稳定性分析将使用这份场。")
+
+    def _compute_field_for_key(self, key):
+        xs, ys, XX, YY, region_masks = self._grid_cache
+        field = np.full_like(XX, np.nan, dtype=float)
+        seed = int(self.spin_field_seed.value())
+        theta_x = float(self.spin_theta_x.value())
+        theta_y = float(self.spin_theta_y.value())
+
+        for r_idx, mask in enumerate(region_masks):
+            if mask is None or not mask.any():
+                continue
+            r = self._layer_regions[r_idx]
+            mat_idx = int(r.get("material_index", 0))
+            if not (0 <= mat_idx < len(self.materials_db)):
+                continue
+            mat = self.materials_db[mat_idx]
+            d = getattr(mat, key, None)
+            if not isinstance(d, Distribution):
+                continue
+            eff_mean, eff_std, eff_lo, eff_hi = self._effective_dist_stats(d)
+            if eff_std > 1e-12:
+                from core.random_field import generate_field_on_grid
+                region_seed = int(seed) * 10007 + r_idx * 7919
+                field_r = generate_field_on_grid(
+                    xs, ys, theta_x=theta_x, theta_y=theta_y,
+                    mean=eff_mean, std=eff_std, seed=region_seed)
+                field_r = np.clip(field_r, eff_lo, eff_hi)
+            else:
+                field_r = np.full_like(XX, eff_mean)
+            field[mask] = field_r[mask]
+        return field
+
+    def get_locked_field(self):
+        return self._locked_field
+
+    def clear_locked_field(self):
+        self._locked_field = None
+
+    # ==================================================================
+    # 材料库操作
     # ==================================================================
     def _refresh_material_table(self):
-        """重绘材料列表"""
         self.tbl_materials.blockSignals(True)
         self.tbl_materials.setRowCount(len(self.materials_db))
         for r, m in enumerate(self.materials_db):
@@ -1897,53 +2746,125 @@ class MaterialDockWidget(QDockWidget):
             self.tbl_materials.setItem(r, 3, QTableWidgetItem(f"{m.c_prime:.1f}"))
             self.tbl_materials.setItem(r, 4, QTableWidgetItem(f"{m.phi_deg:.1f}"))
         self.tbl_materials.blockSignals(False)
-
         if 0 <= self.current_material_index < len(self.materials_db):
             self.tbl_materials.selectRow(self.current_material_index)
 
     def _on_material_selected(self, row):
         if row < 0 or row >= len(self.materials_db):
             return
+        if row == self.current_material_index:
+            return
         self.current_material_index = row
         self._load_material_params(row)
 
     def _load_material_params(self, idx):
+        if not (0 <= idx < len(self.materials_db)):
+            return
         m = self.materials_db[idx]
         self.lbl_current_name.setText(f"{idx + 1}. {m.name}")
-        self.spin_gamma_dry.setValue(m.gamma_dry)
-        self.spin_gamma_sat.setValue(m.gamma_sat)
-        self.spin_c.setValue(m.c_prime)
-        self.spin_phi.setValue(m.phi_deg)
-        self.spin_phib.setValue(m.phi_b_deg)
-        self.spin_cutoff.setValue(m.suction_cutoff)
+
+        for spin, val in ((self.spin_gamma_dry, m.gamma_dry),
+                          (self.spin_gamma_sat, m.gamma_sat),
+                          (self.spin_c, m.c_prime),
+                          (self.spin_phi, m.phi_deg),
+                          (self.spin_phib, m.phi_b_deg),
+                          (self.spin_cutoff, m.suction_cutoff)):
+            spin.blockSignals(True)
+            spin.setValue(val)
+            spin.blockSignals(False)
+
+        self.chk_use_depth.blockSignals(True)
+        self.chk_use_depth.setChecked(m.use_depth_effect)
+        self.chk_use_depth.blockSignals(False)
+        self.spin_c_rate.blockSignals(True)
+        self.spin_c_rate.setValue(m.c_depth_rate)
+        self.spin_c_rate.blockSignals(False)
+        self.spin_phi_rate.blockSignals(True)
+        self.spin_phi_rate.setValue(m.phi_depth_rate)
+        self.spin_phi_rate.blockSignals(False)
+        self.spin_depth_ref.blockSignals(True)
+        self.spin_depth_ref.setValue(m.depth_ref)
+        self.spin_depth_ref.blockSignals(False)
+        self._on_depth_toggle()
+
+        self.chk_use_random.blockSignals(True)
+        self.chk_use_random.setChecked(m.use_random_dist)
+        self.chk_use_random.blockSignals(False)
+
+        for key, wdg in self._dist_widgets.items():
+            d = getattr(m, key, None)
+            if not isinstance(d, Distribution):
+                continue
+            for x in (wdg["combo"], wdg["mean"], wdg["cov"],
+                      wdg["lo"], wdg["hi"]):
+                x.blockSignals(True)
+            for i in range(wdg["combo"].count()):
+                if wdg["combo"].itemData(i) == d.kind:
+                    wdg["combo"].setCurrentIndex(i)
+                    break
+            wdg["mean"].setValue(d.mean)
+            wdg["cov"].setValue(d.cov)
+            lo_val = d.lower if d.lower is not None else d.mean
+            hi_val = d.upper if d.upper is not None else d.mean
+            wdg["lo"].setValue(lo_val)
+            wdg["hi"].setValue(hi_val)
+            for x in (wdg["combo"], wdg["mean"], wdg["cov"],
+                      wdg["lo"], wdg["hi"]):
+                x.blockSignals(False)
+            self._update_dist_row_enabled(key, d.kind)
+
+        self.tbl_dist.setEnabled(m.use_random_dist)
+        self.grp_unsat.setEnabled(m.is_unsaturated)
+
+        self._refresh_depth_profile()
+        self._refresh_preview_tab()
+        if self._preview_mode == "field":
+            self._refresh_spatial_view()
+
+    def _apply_current_material(self):
+        idx = self.current_material_index
+        if not (0 <= idx < len(self.materials_db)):
+            return
+        m = self.materials_db[idx]
+
+        m.gamma_dry = self.spin_gamma_dry.value()
+        m.gamma_sat = self.spin_gamma_sat.value()
+        m.c_prime = self.spin_c.value()
+        m.phi_deg = self.spin_phi.value()
+        m.phi_b_deg = self.spin_phib.value()
+        m.suction_cutoff = self.spin_cutoff.value()
+
+        m.use_depth_effect = self.chk_use_depth.isChecked()
+        m.c_depth_rate = self.spin_c_rate.value()
+        m.phi_depth_rate = self.spin_phi_rate.value()
+        m.depth_ref = self.spin_depth_ref.value()
+
+        m.use_random_dist = self.chk_use_random.isChecked()
+
+        self._refresh_material_table()
+        self._refresh_depth_profile()
+        self._refresh_preview_tab()
+        if self._preview_mode == "field":
+            self._refresh_spatial_view()
+        self.materials_changed.emit()
 
     def _add_material(self):
-        """添加一个新材料"""
         new_idx = len(self.materials_db) + 1
         self.materials_db.append(
-            SoilMaterial(f"材料 {new_idx}", 19.0, 21.0, 15.0, 20.0, False, 15.0, 100.0)
-        )
+            SoilMaterial(f"材料 {new_idx}", 19.0, 21.0, 15.0, 20.0,
+                         False, 15.0, 100.0))
         self.current_material_index = len(self.materials_db) - 1
         self._refresh_material_table()
         self._load_material_params(self.current_material_index)
         self.materials_changed.emit()
 
     def _copy_material(self):
-        """复制当前材料"""
         if not (0 <= self.current_material_index < len(self.materials_db)):
             return
         src = self.materials_db[self.current_material_index]
         new_idx = len(self.materials_db) + 1
-        new_mat = SoilMaterial(
-            name=f"材料 {new_idx} (副本)",
-            gamma_dry=src.gamma_dry,
-            gamma_sat=src.gamma_sat,
-            c_prime=src.c_prime,
-            phi_deg=src.phi_deg,
-            is_unsaturated=src.is_unsaturated,
-            phi_b_deg=src.phi_b_deg,
-            suction_cutoff=src.suction_cutoff,
-        )
+        new_mat = SoilMaterial.from_dict(src.to_dict())
+        new_mat.name = f"材料 {new_idx} (副本)"
         self.materials_db.append(new_mat)
         self.current_material_index = len(self.materials_db) - 1
         self._refresh_material_table()
@@ -1951,59 +2872,29 @@ class MaterialDockWidget(QDockWidget):
         self.materials_changed.emit()
 
     def _del_material(self):
-        """删除当前材料"""
         if len(self.materials_db) <= 1:
             QMessageBox.warning(self, "提示", "至少保留一个材料。")
             return
         if not (0 <= self.current_material_index < len(self.materials_db)):
             return
-
         reply = QMessageBox.question(
             self, "确认删除",
             f"删除材料 '{self.materials_db[self.current_material_index].name}'？\n"
             "引用了该材料的土层面将被自动重定向到第一个材料。",
-            QMessageBox.Yes | QMessageBox.No
-        )
+            QMessageBox.Yes | QMessageBox.No)
         if reply != QMessageBox.Yes:
             return
-
-        deleted_idx = self.current_material_index
-        self.materials_db.pop(deleted_idx)
-        self.current_material_index = max(0, deleted_idx - 1)
+        self.materials_db.pop(self.current_material_index)
+        self.current_material_index = max(0, self.current_material_index - 1)
         self._refresh_material_table()
         self._load_material_params(self.current_material_index)
         self.materials_changed.emit()
 
-    def _apply_current_material(self):
-        """把界面上的参数写回当前材料"""
-        idx = self.current_material_index
-        if not (0 <= idx < len(self.materials_db)):
-            return
-
-        old = self.materials_db[idx]
-        is_unsat = (self.combo_regime.currentIndex() == 1)
-
-        self.materials_db[idx] = SoilMaterial(
-            name=old.name,
-            gamma_dry=self.spin_gamma_dry.value(),
-            gamma_sat=self.spin_gamma_sat.value(),
-            c_prime=self.spin_c.value(),
-            phi_deg=self.spin_phi.value(),
-            is_unsaturated=is_unsat,
-            phi_b_deg=self.spin_phib.value(),
-            suction_cutoff=self.spin_cutoff.value(),
-        )
-        self._refresh_material_table()
-        self.materials_changed.emit()
-
-    # ==================================================================
-    # 工况切换
-    # ==================================================================
     def _on_regime_changed(self, idx):
         is_unsat = (idx == 1)
-        self.grp_unsat.setEnabled(is_unsat)
         for m in self.materials_db:
             m.is_unsaturated = is_unsat
+        self.grp_unsat.setEnabled(is_unsat)
         self.materials_changed.emit()
 
     # ==================================================================
@@ -2016,19 +2907,13 @@ class MaterialDockWidget(QDockWidget):
         return {
             "active_regime": self.combo_regime.currentIndex(),
             "current_material": self.current_material_index,
-            "layers": [
-                {
-                    "name": m.name,
-                    "gamma_dry": m.gamma_dry,
-                    "gamma_sat": m.gamma_sat,
-                    "c_prime": m.c_prime,
-                    "phi_deg": m.phi_deg,
-                    "is_unsaturated": m.is_unsaturated,
-                    "phi_b_deg": m.phi_b_deg,
-                    "suction_cutoff": m.suction_cutoff,
-                }
-                for m in self.materials_db
-            ],
+            "layers": [m.to_dict() for m in self.materials_db],
+            "field_seed": int(self.spin_field_seed.value()),
+            "field_theta_x": float(self.spin_theta_x.value()),
+            "field_theta_y": float(self.spin_theta_y.value()),
+            "field_param_key": (self.combo_field_param.currentData()[0]
+                                if self.combo_field_param.currentData()
+                                else "c_dist"),
         }
 
     def from_dict(self, data):
@@ -2036,33 +2921,40 @@ class MaterialDockWidget(QDockWidget):
             return
         layers = data.get("layers", [])
         if layers:
-            self.materials_db = [
-                SoilMaterial(
-                    name=L.get("name", f"材料 {i + 1}"),
-                    gamma_dry=float(L.get("gamma_dry", 19.0)),
-                    gamma_sat=float(L.get("gamma_sat", 21.0)),
-                    c_prime=float(L.get("c_prime", 15.0)),
-                    phi_deg=float(L.get("phi_deg", 20.0)),
-                    is_unsaturated=bool(L.get("is_unsaturated", False)),
-                    phi_b_deg=float(L.get("phi_b_deg", 15.0)),
-                    suction_cutoff=float(L.get("suction_cutoff", 100.0)),
-                )
-                for i, L in enumerate(layers)
-            ]
-
+            self.materials_db = [SoilMaterial.from_dict(L) for L in layers]
         if not self.materials_db:
-            self.materials_db = [
-                SoilMaterial("材料 1", 19.0, 21.0, 15.0, 20.0, False, 15.0, 100.0),
-            ]
+            self.materials_db = [SoilMaterial("材料 1")]
 
         regime = int(data.get("active_regime", 0))
+        self.combo_regime.blockSignals(True)
         self.combo_regime.setCurrentIndex(regime)
+        self.combo_regime.blockSignals(False)
         self.grp_unsat.setEnabled(regime == 1)
 
         self.current_material_index = int(data.get("current_material", 0))
         self.current_material_index = max(
-            0, min(self.current_material_index, len(self.materials_db) - 1)
-        )
+            0, min(self.current_material_index, len(self.materials_db) - 1))
+
+        if "field_seed" in data:
+            self.spin_field_seed.blockSignals(True)
+            self.spin_field_seed.setValue(int(data["field_seed"]))
+            self.spin_field_seed.blockSignals(False)
+        if "field_theta_x" in data:
+            self.spin_theta_x.blockSignals(True)
+            self.spin_theta_x.setValue(float(data["field_theta_x"]))
+            self.spin_theta_x.blockSignals(False)
+        if "field_theta_y" in data:
+            self.spin_theta_y.blockSignals(True)
+            self.spin_theta_y.setValue(float(data["field_theta_y"]))
+            self.spin_theta_y.blockSignals(False)
+        if "field_param_key" in data:
+            k = str(data["field_param_key"])
+            for i in range(self.combo_field_param.count()):
+                if self.combo_field_param.itemData(i)[0] == k:
+                    self.combo_field_param.setCurrentIndex(i)
+                    break
+
+        self._locked_field = None
         self._refresh_material_table()
         self._load_material_params(self.current_material_index)
 
